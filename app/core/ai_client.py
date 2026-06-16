@@ -6,6 +6,7 @@ from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpe
 
 from app.core.config import Settings
 from app.models.schemas import DocumentBlock, LANGUAGE_NAMES, LanguageCode
+from app.services.translation_memory import GlossaryTerm
 
 
 class AIClientError(RuntimeError):
@@ -33,11 +34,12 @@ class OpenAICompatibleClient:
         blocks: Sequence[DocumentBlock],
         source_lang: LanguageCode,
         target_lang: LanguageCode,
+        glossary_terms: Sequence[GlossaryTerm] | None = None,
     ) -> dict[str, str]:
         if not blocks:
             return {}
 
-        payload = [{"id": block.block_id, "text": block.text} for block in blocks]
+        payload = _build_translation_payload(blocks, glossary_terms)
         response = await self._request_translation(payload, source_lang, target_lang)
 
         content = response.choices[0].message.content
@@ -48,7 +50,7 @@ class OpenAICompatibleClient:
 
     async def _request_translation(
         self,
-        payload: list[dict[str, str]],
+        payload: object,
         source_lang: LanguageCode,
         target_lang: LanguageCode,
     ) -> object:
@@ -90,8 +92,26 @@ def _build_system_prompt(source_lang: LanguageCode, target_lang: LanguageCode) -
         "numbers, tags, codes, and formatting markers. Return only valid JSON "
         'as {"translations":[{"id":"...","translation":"..."}]} with the '
         "same ids. Do not translate code, formulas, standards names, or "
-        "product identifiers."
+        "product identifiers. If glossary terms are provided, use those target "
+        "terms consistently."
     )
+
+
+def _build_translation_payload(
+    blocks: Sequence[DocumentBlock],
+    glossary_terms: Sequence[GlossaryTerm] | None,
+) -> object:
+    block_payload = [{"id": block.block_id, "text": block.text} for block in blocks]
+    if not glossary_terms:
+        return block_payload
+
+    return {
+        "terms": [
+            {"source": term.source, "target": term.target}
+            for term in glossary_terms
+        ],
+        "blocks": block_payload,
+    }
 
 
 def _parse_translation_response(
@@ -137,6 +157,7 @@ class MockAIClient:
         blocks: Sequence[DocumentBlock],
         source_lang: LanguageCode,
         target_lang: LanguageCode,
+        glossary_terms: Sequence[GlossaryTerm] | None = None,
     ) -> dict[str, str]:
         return {
             block.block_id: f"{block.text} [{target_lang}]"

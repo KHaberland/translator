@@ -34,3 +34,23 @@ class TranslateResponse(BaseModel):
     file_path: str
     estimated_characters: int
     estimated_tokens: int
+
+
+class TranslateJobResponse(BaseModel):
+    job_id: str
+    status: str
+
+
+class JobStatusResponse(BaseModel):
+    job_id: str
+    status: str
+    progress: int
+    result_file: str | None = None
+    error: str | None = None
+
+
+class ProgressEvent(BaseModel):
+    job_id: str
+    stage: str
+    progress: int
+    message: str

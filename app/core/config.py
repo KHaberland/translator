@@ -15,6 +15,13 @@ class Settings(BaseSettings):
     max_batch_chars: int = 8000
     max_batch_blocks: int = 30
     max_file_size_mb: int = 25
+    redis_url: str = "redis://localhost:6379/0"
+    celery_broker_url: str = "redis://localhost:6379/0"
+    celery_result_backend: str = "redis://localhost:6379/1"
+    job_ttl_seconds: int = 86400
+    translation_cache_ttl_seconds: int = 2592000
+    progress_stream_max_events: int = 200
+    translation_memory_db_path: Path = Field(default=Path("data") / "translation_memory.sqlite3")
     upload_dir: Path = Field(default=Path("uploads"))
     output_dir: Path = Field(default=Path("outputs"))
     tmp_dir: Path = Field(default=Path("tmp"))
@@ -41,5 +48,6 @@ def ensure_storage_dirs(settings: Settings | None = None) -> None:
         current_settings.upload_dir,
         current_settings.output_dir,
         current_settings.tmp_dir,
+        current_settings.translation_memory_db_path.parent,
     ):
         directory.mkdir(parents=True, exist_ok=True)

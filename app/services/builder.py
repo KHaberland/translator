@@ -4,6 +4,8 @@ from docx import Document
 from docx.table import Table
 from docx.text.paragraph import Paragraph
 
+from app.services.run_preserver import replace_paragraph_text_preserving_runs
+
 
 def build_translated_docx(
     source_path: Path,
@@ -47,10 +49,4 @@ def _replace_paragraph_text(
     if translated_text is None:
         return
 
-    if not paragraph.runs:
-        paragraph.add_run(translated_text)
-        return
-
-    paragraph.runs[0].text = translated_text
-    for run in paragraph.runs[1:]:
-        run.text = ""
+    replace_paragraph_text_preserving_runs(paragraph, translated_text)
