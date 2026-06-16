@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+python-docx
+pydantic
+pydantic-settings
+openai
+python-multipart
+python-dotenv
+pytest
