@@ -11,6 +11,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from redis.exceptions import RedisError
 
+from app.api.download import get_translation_download
 from app.api.status import get_translation_status
 from app.api.translate import translate_docx
 from app.core.cache import RedisTranslationCache, build_cache_key
@@ -585,6 +586,69 @@ def test_status_endpoint_returns_404_for_missing_job(monkeypatch):
     assert exc_info.value.detail == "translation job not found"
 
 
+def test_download_endpoint_returns_completed_result(tmp_path, monkeypatch):
+    store = InMemoryJobStore()
+    result_path = _create_docx(tmp_path, "translated.docx", "Привет")
+    store.create_job(
+        _job(
+            "job-download",
+            status=JobStatus.COMPLETED,
+            progress=100,
+            result_file=result_path.as_posix(),
+        )
+    )
+    monkeypatch.setattr("app.api.download.get_job_store", lambda: store)
+
+    response = get_translation_download("job-download")
+
+    assert response.path == result_path
+    assert response.media_type == (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    )
+    assert response.filename == "translated.docx"
+
+
+def test_download_endpoint_returns_404_for_missing_job(monkeypatch):
+    monkeypatch.setattr("app.api.download.get_job_store", lambda: InMemoryJobStore())
+
+    with pytest.raises(HTTPException) as exc_info:
+        get_translation_download("missing")
+
+    assert exc_info.value.status_code == 404
+    assert exc_info.value.detail == "translation job not found"
+
+
+def test_download_endpoint_returns_409_when_result_is_not_ready(monkeypatch):
+    store = InMemoryJobStore()
+    store.create_job(_job("job-not-ready", status=JobStatus.TRANSLATING, progress=50))
+    monkeypatch.setattr("app.api.download.get_job_store", lambda: store)
+
+    with pytest.raises(HTTPException) as exc_info:
+        get_translation_download("job-not-ready")
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == "translation result is not ready"
+
+
+def test_download_endpoint_returns_404_when_result_file_is_missing(tmp_path, monkeypatch):
+    store = InMemoryJobStore()
+    store.create_job(
+        _job(
+            "job-missing-file",
+            status=JobStatus.COMPLETED,
+            progress=100,
+            result_file=(tmp_path / "missing.docx").as_posix(),
+        )
+    )
+    monkeypatch.setattr("app.api.download.get_job_store", lambda: store)
+
+    with pytest.raises(HTTPException) as exc_info:
+        get_translation_download("job-missing-file")
+
+    assert exc_info.value.status_code == 404
+    assert exc_info.value.detail == "translation result file not found"
+
+
 def test_stream_endpoint_returns_sse_headers(monkeypatch):
     store = InMemoryJobStore()
     store.create_job(
@@ -774,6 +838,7 @@ def _job(
     status: JobStatus = JobStatus.QUEUED,
     progress: int = 0,
     error: str | None = None,
+    result_file: str | None = None,
 ) -> TranslationJob:
     return TranslationJob(
         job_id=job_id,
@@ -783,6 +848,7 @@ def _job(
         target_lang=LanguageCode.RU,
         original_filename="source.docx",
         upload_path="uploads/source.docx",
+        result_file=result_file,
         error=error,
     )
 

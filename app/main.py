@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from app.api.download import router as download_router
 from app.api.status import router as status_router
 from app.api.stream import router as stream_router
 from app.api.translate import router as translate_router
@@ -29,3 +30,4 @@ def health() -> dict[str, str]:
 app.include_router(translate_router)
 app.include_router(status_router)
 app.include_router(stream_router)
+app.include_router(download_router)
