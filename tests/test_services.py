@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from redis.exceptions import RedisError
 
 from app.api.download import get_translation_download
+from app.api.estimate import estimate_docx
 from app.api.status import get_translation_status
 from app.api.translate import translate_docx
 from app.core.cache import RedisTranslationCache, build_cache_key
@@ -24,6 +25,11 @@ from app.models.schemas import DocumentBlock, LanguageCode
 from app.services.builder import build_translated_docx
 from app.services.cost_estimator import estimate_translation_cost
 from app.services.docx_parser import extract_docx_blocks
+from app.services.price_estimator import (
+    budget_status,
+    estimate_output_tokens,
+    estimate_translation_cost_usd,
+)
 from app.services.segmenter import build_translation_batches
 from app.services.translator import DocumentProcessingError, translate_docx_file
 from app.services.translation_cache import TranslationCache, normalize_translation_cache_text
@@ -227,6 +233,108 @@ def test_cost_estimator_counts_only_translatable_blocks():
 
     assert estimate.translatable_characters == 8
     assert estimate.estimated_tokens == 2
+
+
+def test_price_estimator_calculates_output_tokens_cost_and_budget():
+    settings = Settings(
+        openai_input_price_per_1m_tokens=0.15,
+        openai_output_price_per_1m_tokens=0.60,
+    )
+    output_tokens = estimate_output_tokens(10, 1.2)
+
+    assert output_tokens == 12
+    assert estimate_translation_cost_usd(10, output_tokens, settings) == 0.000009
+    assert budget_status(0.01, 1) == "ok"
+    assert budget_status(1.01, 1) == "exceeded"
+
+
+def test_estimate_endpoint_accepts_docx_and_does_not_enqueue_job(tmp_path, monkeypatch):
+    docx_path = tmp_path / "estimate.docx"
+    document = Document()
+    document.add_paragraph("Hello world")
+    document.add_paragraph("API123")
+    document.save(docx_path)
+    file = _UploadFileStub(
+        filename="estimate.docx",
+        content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        content=docx_path.read_bytes(),
+    )
+
+    monkeypatch.setattr(
+        "app.api.estimate.get_settings",
+        lambda: Settings(
+            tmp_dir=tmp_path / "tmp",
+            translation_budget_usd=10,
+            estimated_output_token_multiplier=1.2,
+            translation_memory_db_path=tmp_path / "memory.sqlite3",
+        ),
+    )
+    monkeypatch.setattr(
+        "app.api.estimate.extract_docx_blocks",
+        lambda path: [
+            _block("b1", "Hello world"),
+            _block("b2", "API123", translatable=False),
+        ],
+    )
+    monkeypatch.setattr(
+        "app.api.estimate.get_job_store",
+        lambda: pytest.fail("estimate should not create jobs"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "app.api.estimate._enqueue_translation_job",
+        lambda job_id: pytest.fail("estimate should not enqueue Celery tasks"),
+        raising=False,
+    )
+
+    response = asyncio.run(
+        estimate_docx(
+            file=file,
+            source_lang=LanguageCode.EN,
+            target_lang=LanguageCode.RU,
+        )
+    )
+
+    assert response.file_name == "estimate.docx"
+    assert response.translatable_blocks == 1
+    assert response.skipped_blocks == 1
+    assert response.estimated_characters == 11
+    assert response.estimated_input_tokens == 3
+    assert response.estimated_output_tokens == 4
+    assert response.estimated_total_tokens == 7
+    assert response.estimated_cost_usd > 0
+    assert response.budget_status == "ok"
+
+
+def test_estimate_endpoint_returns_exceeded_budget(tmp_path, monkeypatch):
+    docx_path = _create_docx(tmp_path, "expensive.docx", "Hello")
+    file = _UploadFileStub(
+        filename="expensive.docx",
+        content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        content=docx_path.read_bytes(),
+    )
+
+    monkeypatch.setattr(
+        "app.api.estimate.get_settings",
+        lambda: Settings(
+            tmp_dir=tmp_path / "tmp",
+            translation_budget_usd=0,
+            estimated_output_token_multiplier=1.2,
+            translation_memory_db_path=tmp_path / "memory.sqlite3",
+        ),
+    )
+
+    response = asyncio.run(
+        estimate_docx(
+            file=file,
+            source_lang=LanguageCode.EN,
+            target_lang=LanguageCode.RU,
+        )
+    )
+
+    assert response.estimated_characters == 5
+    assert response.estimated_total_tokens > 0
+    assert response.budget_status == "exceeded"
 
 
 def test_translate_endpoint_rejects_equal_languages_before_reading_file():

@@ -36,6 +36,21 @@ class TranslateResponse(BaseModel):
     estimated_tokens: int
 
 
+class EstimateResponse(BaseModel):
+    file_name: str
+    source_lang: str
+    target_lang: str
+    translatable_blocks: int
+    skipped_blocks: int
+    estimated_characters: int
+    estimated_input_tokens: int
+    estimated_output_tokens: int
+    estimated_total_tokens: int
+    estimated_cost_usd: float
+    budget_usd: float
+    budget_status: str
+
+
 class TranslateJobResponse(BaseModel):
     job_id: str
     status: str

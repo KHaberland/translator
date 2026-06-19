@@ -6,7 +6,7 @@
 
 Система состоит из четырех основных частей:
 
-- FastAPI backend принимает DOCX, создает translation job и отдает status/download endpoints.
+- FastAPI backend принимает DOCX, считает предварительную оценку стоимости, создает translation job и отдает status/download endpoints.
 - Celery worker выполняет перевод в фоне.
 - Redis хранит состояние jobs, Celery broker/result backend, progress events и межзадачный cache переводов.
 - PySide6 desktop UI выбирает DOCX, отправляет файл в backend, опрашивает статус и скачивает готовый результат.
@@ -42,16 +42,14 @@ Desktop UI:
 ```text
 Translator_MVP/
 ├── app/
-│   ├── __init__.py
 │   ├── main.py
 │   ├── api/
-│   │   ├── __init__.py
 │   │   ├── download.py
+│   │   ├── estimate.py
 │   │   ├── status.py
 │   │   ├── stream.py
 │   │   └── translate.py
 │   ├── core/
-│   │   ├── __init__.py
 │   │   ├── ai_client.py
 │   │   ├── cache.py
 │   │   ├── celery_app.py
@@ -59,14 +57,13 @@ Translator_MVP/
 │   │   ├── job_store.py
 │   │   └── progress_events.py
 │   ├── models/
-│   │   ├── __init__.py
 │   │   ├── jobs.py
 │   │   └── schemas.py
 │   └── services/
-│       ├── __init__.py
 │       ├── builder.py
 │       ├── cost_estimator.py
 │       ├── docx_parser.py
+│       ├── price_estimator.py
 │       ├── run_preserver.py
 │       ├── segmenter.py
 │       ├── translation_cache.py
@@ -86,7 +83,6 @@ Translator_MVP/
 │       ├── main_window.py
 │       └── widgets.py
 ├── workers/
-│   ├── __init__.py
 │   └── translation_worker.py
 ├── tests/
 │   ├── test_desktop_api_client.py
@@ -98,8 +94,10 @@ Translator_MVP/
 ├── MANUAL_TESTS.md
 ├── PLAN.md
 ├── plan_upgrade01.md
+├── plan_upgrade02.md
 ├── paln_upgrade02.md
 ├── app_structure.md
+├── .env.example
 └── requirements.txt
 ```
 
@@ -110,7 +108,7 @@ Translator_MVP/
 ```text
 Desktop UI (PySide6)
         |
-        | HTTP: /translate, /status, /download
+        | HTTP: /estimate, /translate, /status, /download
         v
 FastAPI backend
         |
@@ -146,7 +144,7 @@ DOCX pipeline + OpenAI/Mock AI + SQLite translation memory
 - создание `FastAPI` app;
 - lifespan-инициализацию директорий `uploads/`, `outputs/`, `tmp/`, `data/`;
 - endpoint `GET /health`;
-- подключение router-ов `translate`, `status`, `stream`, `download`.
+- подключение router-ов `translate`, `estimate`, `status`, `stream`, `download`.
 
 ### `app/api/translate.py`
 
@@ -172,6 +170,26 @@ Endpoint-ы загрузки DOCX.
 - возвращает `job_id` и начальный статус.
 
 `POST /translate/sync` выполняет DOCX pipeline сразу в API-процессе и возвращает путь к готовому файлу. Основной UI его не использует.
+
+### `app/api/estimate.py`
+
+Endpoint `POST /estimate/`.
+
+Реализует предварительную оценку DOCX без создания translation job и без постановки Celery task.
+
+Поведение:
+
+- принимает multipart DOCX в поле `file`;
+- принимает `source_lang` и `target_lang`;
+- запрещает одинаковые языки;
+- использует общую DOCX-валидацию upload endpoint-а;
+- временно сохраняет файл в `tmp/`;
+- извлекает блоки через DOCX parser;
+- считает переводимые и пропущенные блоки;
+- оценивает input/output/total tokens;
+- считает примерную стоимость в USD;
+- возвращает бюджет и `budget_status`: `ok` или `exceeded`;
+- удаляет временный файл после обработки.
 
 ### `app/api/status.py`
 
@@ -226,6 +244,10 @@ Desktop UI в MVP использует polling через `/status/{job_id}`. SS
 - `OPENAI_BASE_URL`;
 - `OPENAI_TIMEOUT_SECONDS`;
 - `OPENAI_MAX_RETRIES`;
+- `OPENAI_INPUT_PRICE_PER_1M_TOKENS`;
+- `OPENAI_OUTPUT_PRICE_PER_1M_TOKENS`;
+- `TRANSLATION_BUDGET_USD`;
+- `ESTIMATED_OUTPUT_TOKEN_MULTIPLIER`;
 - `MAX_BATCH_CHARS`;
 - `MAX_BATCH_BLOCKS`;
 - `MAX_FILE_SIZE_MB`;
@@ -319,6 +341,7 @@ Pydantic-схемы API и переводимых блоков.
 - `LANGUAGE_NAMES`;
 - `DocumentBlock`;
 - `TranslateResponse`;
+- `EstimateResponse`;
 - `TranslateJobResponse`;
 - `JobStatusResponse`;
 - `ProgressEvent`.
@@ -421,6 +444,18 @@ SQLite translation memory и glossary.
 - количество символов только в переводимых блоках;
 - примерную оценку токенов как `ceil(characters / 4)`.
 
+### `app/services/price_estimator.py`
+
+Оценка стоимости перевода в USD.
+
+Считает:
+
+- output tokens по multiplier из настроек;
+- стоимость input tokens по цене за 1M tokens;
+- стоимость output tokens по цене за 1M tokens;
+- итоговую стоимость с округлением;
+- статус бюджета `ok` или `exceeded`.
+
 ### `app/services/builder.py`
 
 Сборка итогового DOCX.
@@ -503,6 +538,7 @@ HTTP-клиент UI.
 
 Методы:
 
+- `estimate(file_path, source, target)` -> `POST /estimate/`;
 - `upload(file_path, source, target)` -> `POST /translate/`;
 - `get_status(job_id)` -> `GET /status/{job_id}`;
 - `download(job_id, save_path, result_file)` -> `GET /download/{job_id}`.
@@ -510,6 +546,7 @@ HTTP-клиент UI.
 Отвечает за:
 
 - multipart upload;
+- multipart estimate request;
 - сохранение скачанного DOCX в выбранный путь;
 - короткие пользовательские ошибки;
 - fallback-сообщение с `result_file`, если backend без `/download/{job_id}` вернул `404 Not Found`.
@@ -522,12 +559,14 @@ QThread worker-ы для сетевых операций без блокиров
 
 Содержит:
 
+- `EstimateWorker`;
 - `UploadWorker`;
 - `PollingWorker`;
 - `DownloadWorker`.
 
 Signals:
 
+- estimate: `started_signal`, `estimated_signal(dict)`, `error_signal(str)`;
 - upload: `started_signal`, `uploaded_signal(dict)`, `error_signal(str)`;
 - polling: `status_signal(str)`, `progress_signal(int)`, `completed_signal(dict)`, `failed_signal(str)`, `error_signal(str)`;
 - download: `started_signal`, `downloaded_signal(str)`, `error_signal(str)`.
@@ -542,6 +581,7 @@ UI элементы:
 - label выбранного пути;
 - source language dropdown;
 - target language dropdown;
+- `Estimate cost`;
 - `Translate`;
 - `Job ID`;
 - `Status`;
@@ -553,18 +593,28 @@ UI элементы:
 
 - принимает только `.docx`;
 - запрещает одинаковые языки;
-- отключает input во время upload;
+- позволяет предварительно оценить стоимость перевода;
+- показывает characters, tokens, estimated cost, budget и статус бюджета;
+- при превышении бюджета просит подтверждение перед запуском перевода;
+- отключает input во время estimate/upload;
 - запускает polling после успешного upload;
 - отображает все backend-статусы, включая `estimating`;
 - включает download только при `completed`;
 - предлагает имя результата вида `source_translated_to_ru.docx`;
-- не закрывает окно во время активного upload/download;
+- не закрывает окно во время активного estimate/upload/download;
 - останавливает polling при закрытии окна.
 
 ## Основной async flow
 
 ```text
 Desktop UI
+        |
+        | POST /estimate/ (optional preflight)
+        v
+FastAPI validates DOCX + estimates chars/tokens/cost/budget
+        |
+        v
+Desktop UI shows estimate and may ask confirmation if budget exceeded
         |
         | POST /translate/
         v
@@ -698,6 +748,7 @@ $env:MOCK_AI_ENABLED = "false"
 Реализовано:
 
 - `GET /health`;
+- `POST /estimate/`;
 - `POST /translate/`;
 - `POST /translate/sync`;
 - `GET /status/{job_id}`;
@@ -805,8 +856,8 @@ py -m desktop_ui.main
 
 Основные группы:
 
-- `tests/test_services.py` - backend, DOCX services, worker, endpoints, SSE, download;
-- `tests/test_desktop_api_client.py` - desktop `ApiClient` без запуска Qt.
+- `tests/test_services.py` - backend, DOCX services, worker, endpoints, SSE, download, estimate endpoint, price estimator;
+- `tests/test_desktop_api_client.py` - desktop `ApiClient.estimate()` без запуска Qt.
 
 Покрывается:
 
@@ -819,6 +870,8 @@ py -m desktop_ui.main
 - Redis translation cache;
 - segmenter limits;
 - cost estimator;
+- price estimator;
+- estimate endpoint;
 - валидация upload endpoint;
 - mock DOCX-проход;
 - Redis cache hit/save;
@@ -829,7 +882,8 @@ py -m desktop_ui.main
 - download endpoint;
 - SSE stream endpoint;
 - worker success/failure flow;
-- desktop API error mapping.
+- desktop API error mapping;
+- desktop estimate API flow.
 
 Запуск:
 
@@ -837,13 +891,14 @@ py -m desktop_ui.main
 py -m pytest
 ```
 
-Последняя проверка после обновления desktop UI: `37 passed`, 1 warning от `fastapi.testclient`.
+В исходниках сейчас 40 test-функций. Актуальный результат проверки нужно обновлять после запуска `py -m pytest`.
 
 ## Текущий статус архитектуры
 
 Приложение больше не является backend-only MVP:
 
 - есть отдельный PySide6 desktop UI;
+- есть предварительная оценка стоимости через `/estimate/`;
 - основной перевод выполняется через async jobs;
 - состояние job хранится в Redis;
 - progress доступен через status endpoint и SSE;

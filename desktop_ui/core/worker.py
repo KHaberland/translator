@@ -43,6 +43,43 @@ class UploadWorker(QThread):
         self.uploaded_signal.emit(payload)
 
 
+class EstimateWorker(QThread):
+    started_signal = Signal()
+    estimated_signal = Signal(dict)
+    error_signal = Signal(str)
+
+    def __init__(
+        self,
+        file_path: str,
+        source_language: str,
+        target_language: str,
+        api_client: ApiClient | None = None,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.file_path = file_path
+        self.source_language = source_language
+        self.target_language = target_language
+        self.api_client = api_client or ApiClient()
+
+    def run(self) -> None:
+        self.started_signal.emit()
+        try:
+            payload: dict[str, Any] = self.api_client.estimate(
+                self.file_path,
+                self.source_language,
+                self.target_language,
+            )
+        except ApiClientError as exc:
+            self.error_signal.emit(str(exc))
+            return
+        except Exception as exc:
+            self.error_signal.emit(f"Unexpected estimate error: {exc}")
+            return
+
+        self.estimated_signal.emit(payload)
+
+
 class PollingWorker(QThread):
     status_signal = Signal(str)
     progress_signal = Signal(int)

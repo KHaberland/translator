@@ -47,6 +47,34 @@ class ApiClient:
 
         return self._json_response(response, "Upload failed")
 
+    def estimate(self, file_path: str, source: str, target: str) -> dict[str, Any]:
+        path = Path(file_path)
+        if not path.is_file():
+            raise ApiClientError("File does not exist")
+
+        url = f"{self.base_url}/estimate/"
+        try:
+            with path.open("rb") as file_handle:
+                response = requests.post(
+                    url,
+                    files={
+                        "file": (
+                            path.name,
+                            file_handle,
+                            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        )
+                    },
+                    data={
+                        "source_lang": source,
+                        "target_lang": target,
+                    },
+                    timeout=self.timeout,
+                )
+        except requests.RequestException as exc:
+            raise ApiClientError(self._request_error_message(exc)) from exc
+
+        return self._json_response(response, "Estimate failed")
+
     def get_status(self, job_id: str) -> dict[str, Any]:
         url = f"{self.base_url}/status/{job_id}"
         try:
@@ -150,6 +178,7 @@ class ApiClient:
             "translation provider failed": "Translation failed",
             "failed to process DOCX file": "Translation failed",
             "translation queue is unavailable": "Backend queue is unavailable",
+            "file is too large": "File is too large",
         }
         if detail in known_details:
             return known_details[detail]

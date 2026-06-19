@@ -12,6 +12,10 @@ class Settings(BaseSettings):
     openai_base_url: str = ""
     openai_timeout_seconds: float = 60
     openai_max_retries: int = 2
+    openai_input_price_per_1m_tokens: float = 0.15
+    openai_output_price_per_1m_tokens: float = 0.60
+    translation_budget_usd: float = 10
+    estimated_output_token_multiplier: float = 1.2
     max_batch_chars: int = 8000
     max_batch_blocks: int = 30
     max_file_size_mb: int = 25

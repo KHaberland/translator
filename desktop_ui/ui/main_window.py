@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from desktop_ui.core.worker import DownloadWorker, PollingWorker, UploadWorker
+from desktop_ui.core.worker import DownloadWorker, EstimateWorker, PollingWorker, UploadWorker
 
 
 LANGUAGES = ["en", "ru", "lv", "lt", "et"]
@@ -29,6 +29,9 @@ class MainWindow(QMainWindow):
         self.selected_file_path: str | None = None
         self.current_job_id: str | None = None
         self.result_file: str | None = None
+        self.last_estimate: dict | None = None
+        self.last_estimate_context: tuple[str, str, str] | None = None
+        self.estimate_worker: EstimateWorker | None = None
         self.upload_worker: UploadWorker | None = None
         self.polling_worker: PollingWorker | None = None
         self.download_worker: DownloadWorker | None = None
@@ -51,6 +54,9 @@ class MainWindow(QMainWindow):
 
         self.translate_button = QPushButton("Translate")
         self.translate_button.setEnabled(False)
+
+        self.estimate_button = QPushButton("Estimate cost")
+        self.estimate_button.setEnabled(False)
 
         self.job_id_value_label = QLabel("-")
         self.job_id_value_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -88,6 +94,7 @@ class MainWindow(QMainWindow):
         main_layout.addLayout(form_layout)
         main_layout.addWidget(self.progress_bar)
         main_layout.addWidget(self.message_label)
+        main_layout.addWidget(self.estimate_button)
         main_layout.addWidget(self.translate_button)
         main_layout.addWidget(self.download_button)
         main_layout.addStretch()
@@ -96,8 +103,9 @@ class MainWindow(QMainWindow):
 
     def _connect_signals(self) -> None:
         self.select_file_button.clicked.connect(self._select_docx)
-        self.source_language_combo.currentTextChanged.connect(self._update_validation)
-        self.target_language_combo.currentTextChanged.connect(self._update_validation)
+        self.source_language_combo.currentTextChanged.connect(self._handle_language_change)
+        self.target_language_combo.currentTextChanged.connect(self._handle_language_change)
+        self.estimate_button.clicked.connect(self._start_estimate)
         self.translate_button.clicked.connect(self._start_upload)
         self.download_button.clicked.connect(self._download_result)
 
@@ -116,10 +124,17 @@ class MainWindow(QMainWindow):
         self.file_path_label.setText(file_path)
         self.current_job_id = None
         self.result_file = None
+        self.last_estimate = None
+        self.last_estimate_context = None
         self.job_id_value_label.setText("-")
         self.status_value_label.setText("idle")
         self.progress_bar.setValue(0)
         self.download_button.setEnabled(False)
+        self._update_validation()
+
+    def _handle_language_change(self, *_args: object) -> None:
+        self.last_estimate = None
+        self.last_estimate_context = None
         self._update_validation()
 
     def _update_validation(self, *_args: object) -> None:
@@ -132,7 +147,9 @@ class MainWindow(QMainWindow):
             != self.target_language_combo.currentText()
         )
 
-        self.translate_button.setEnabled(has_valid_docx and languages_are_different)
+        can_start = has_valid_docx and languages_are_different
+        self.estimate_button.setEnabled(can_start)
+        self.translate_button.setEnabled(can_start)
 
         if selected_path is None:
             self.message_label.setText("Select a DOCX file to continue")
@@ -143,9 +160,54 @@ class MainWindow(QMainWindow):
         else:
             self.message_label.setText("Ready")
 
+    def _start_estimate(self, *_args: object) -> None:
+        if self.selected_file_path is None:
+            self._update_validation()
+            return
+
+        self.last_estimate = None
+        self.last_estimate_context = None
+        self.status_value_label.setText("estimating")
+        self.message_label.setText("Estimating translation cost...")
+
+        self.estimate_worker = EstimateWorker(
+            file_path=self.selected_file_path,
+            source_language=self.source_language_combo.currentText(),
+            target_language=self.target_language_combo.currentText(),
+            parent=self,
+        )
+        self.estimate_worker.started_signal.connect(self._set_estimating_state)
+        self.estimate_worker.estimated_signal.connect(self._handle_estimate_success)
+        self.estimate_worker.error_signal.connect(self._handle_estimate_error)
+        self.estimate_worker.finished.connect(self._cleanup_estimate_worker)
+        self.estimate_worker.start()
+
+    def _set_estimating_state(self) -> None:
+        self.select_file_button.setEnabled(False)
+        self.source_language_combo.setEnabled(False)
+        self.target_language_combo.setEnabled(False)
+        self.estimate_button.setEnabled(False)
+        self.translate_button.setEnabled(False)
+
+    def _handle_estimate_success(self, payload: dict) -> None:
+        self.last_estimate = payload
+        self.last_estimate_context = self._current_estimate_context()
+        self.status_value_label.setText("estimated")
+        self.message_label.setText(self._format_estimate(payload))
+        self._set_idle_state(update_message=False)
+
+    def _handle_estimate_error(self, message: str) -> None:
+        self.last_estimate = None
+        self.last_estimate_context = None
+        self.status_value_label.setText("idle")
+        self.message_label.setText(self._friendly_worker_error(message))
+        self._set_idle_state(update_message=False)
+
     def _start_upload(self, *_args: object) -> None:
         if self.selected_file_path is None:
             self._update_validation()
+            return
+        if not self._confirm_budget_if_needed():
             return
 
         self._stop_polling()
@@ -173,6 +235,7 @@ class MainWindow(QMainWindow):
         self.select_file_button.setEnabled(False)
         self.source_language_combo.setEnabled(False)
         self.target_language_combo.setEnabled(False)
+        self.estimate_button.setEnabled(False)
         self.translate_button.setEnabled(False)
 
     def _handle_upload_success(self, payload: dict) -> None:
@@ -316,10 +379,62 @@ class MainWindow(QMainWindow):
         }
         return known_errors.get(message, message or "Translation failed")
 
+    def _format_estimate(self, payload: dict) -> str:
+        characters = int(payload.get("estimated_characters", 0))
+        tokens = int(payload.get("estimated_total_tokens", 0))
+        cost = float(payload.get("estimated_cost_usd", 0))
+        budget = float(payload.get("budget_usd", 0))
+        status = (
+            "Budget exceeded"
+            if payload.get("budget_status") == "exceeded"
+            else "OK"
+        )
+        return (
+            f"Text: {characters:,} chars\n"
+            f"Tokens: {tokens:,}\n"
+            f"Estimated cost: ${cost:.4f}\n"
+            f"Budget: ${budget:.2f}\n"
+            f"Status: {status}"
+        )
+
+    def _current_estimate_context(self) -> tuple[str, str, str] | None:
+        if self.selected_file_path is None:
+            return None
+        return (
+            self.selected_file_path,
+            self.source_language_combo.currentText(),
+            self.target_language_combo.currentText(),
+        )
+
+    def _confirm_budget_if_needed(self) -> bool:
+        if (
+            self.last_estimate is None
+            or self.last_estimate_context != self._current_estimate_context()
+            or self.last_estimate.get("budget_status") != "exceeded"
+        ):
+            return True
+
+        message_box = QMessageBox(self)
+        message_box.setWindowTitle("Budget exceeded")
+        message_box.setText("Estimated cost exceeds your budget. Continue anyway?")
+        cancel_button = message_box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        continue_button = message_box.addButton(
+            "Continue",
+            QMessageBox.ButtonRole.AcceptRole,
+        )
+        message_box.setDefaultButton(cancel_button)
+        message_box.exec()
+        return message_box.clickedButton() == continue_button
+
     def _stop_polling(self) -> None:
         if self.polling_worker is not None and self.polling_worker.isRunning():
             self.polling_worker.stop()
             self.polling_worker.wait(1000)
+
+    def _cleanup_estimate_worker(self) -> None:
+        if self.estimate_worker is not None:
+            self.estimate_worker.deleteLater()
+            self.estimate_worker = None
 
     def _cleanup_upload_worker(self) -> None:
         if self.upload_worker is not None:
@@ -341,7 +456,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "Operation in progress",
-                "Upload or download is still running. Please wait for it to finish before closing the window.",
+                "Estimate, upload, or download is still running. Please wait for it to finish before closing the window.",
             )
             event.ignore()
             return
@@ -350,8 +465,10 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def _has_blocking_worker(self) -> bool:
-        return self._is_worker_running(self.upload_worker) or self._is_worker_running(
-            self.download_worker
+        return (
+            self._is_worker_running(self.estimate_worker)
+            or self._is_worker_running(self.upload_worker)
+            or self._is_worker_running(self.download_worker)
         )
 
     @staticmethod
