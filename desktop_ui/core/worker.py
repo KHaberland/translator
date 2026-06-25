@@ -3,7 +3,7 @@ from typing import Any
 from PySide6.QtCore import QObject, QThread, Signal
 
 from desktop_ui.config import POLL_INTERVAL
-from desktop_ui.core.api_client import ApiClient, ApiClientError
+from desktop_ui.core.api_client import ApiClient, ApiClientError, PDF_MODE_SIMPLE
 
 
 class UploadWorker(QThread):
@@ -16,6 +16,7 @@ class UploadWorker(QThread):
         file_path: str,
         source_language: str,
         target_language: str,
+        pdf_mode: str = PDF_MODE_SIMPLE,
         api_client: ApiClient | None = None,
         parent: QObject | None = None,
     ) -> None:
@@ -23,6 +24,7 @@ class UploadWorker(QThread):
         self.file_path = file_path
         self.source_language = source_language
         self.target_language = target_language
+        self.pdf_mode = pdf_mode
         self.api_client = api_client or ApiClient()
 
     def run(self) -> None:
@@ -32,6 +34,7 @@ class UploadWorker(QThread):
                 self.file_path,
                 self.source_language,
                 self.target_language,
+                self.pdf_mode,
             )
         except ApiClientError as exc:
             self.error_signal.emit(str(exc))
@@ -53,6 +56,7 @@ class EstimateWorker(QThread):
         file_path: str,
         source_language: str,
         target_language: str,
+        pdf_mode: str = PDF_MODE_SIMPLE,
         api_client: ApiClient | None = None,
         parent: QObject | None = None,
     ) -> None:
@@ -60,6 +64,7 @@ class EstimateWorker(QThread):
         self.file_path = file_path
         self.source_language = source_language
         self.target_language = target_language
+        self.pdf_mode = pdf_mode
         self.api_client = api_client or ApiClient()
 
     def run(self) -> None:
@@ -69,6 +74,7 @@ class EstimateWorker(QThread):
                 self.file_path,
                 self.source_language,
                 self.target_language,
+                self.pdf_mode,
             )
         except ApiClientError as exc:
             self.error_signal.emit(str(exc))

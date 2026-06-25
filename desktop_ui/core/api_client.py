@@ -5,6 +5,9 @@ import requests
 
 from desktop_ui.config import API_BASE_URL, REQUEST_TIMEOUT
 
+PDF_MODE_SIMPLE = "simple"
+PDF_MODE_LAYOUT = "layout"
+
 
 class ApiClientError(RuntimeError):
     """Raised when the backend API returns an error or cannot be reached."""
@@ -19,17 +22,19 @@ class ApiClient:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
 
-    def upload(self, file_path: str, source: str, target: str) -> dict[str, Any]:
+    def upload(
+        self,
+        file_path: str,
+        source: str,
+        target: str,
+        pdf_mode: str = PDF_MODE_SIMPLE,
+    ) -> dict[str, Any]:
         path = Path(file_path)
         if not path.is_file():
             raise ApiClientError("File does not exist")
 
         file_type = self._file_type(path)
-        url = (
-            f"{self.base_url}/translate/pdf"
-            if file_type == "pdf"
-            else f"{self.base_url}/translate/"
-        )
+        url = self._upload_url(file_type, pdf_mode)
         try:
             with path.open("rb") as file_handle:
                 response = requests.post(
@@ -52,12 +57,19 @@ class ApiClient:
 
         return self._json_response(response, "Upload failed")
 
-    def estimate(self, file_path: str, source: str, target: str) -> dict[str, Any]:
+    def estimate(
+        self,
+        file_path: str,
+        source: str,
+        target: str,
+        pdf_mode: str = PDF_MODE_SIMPLE,
+    ) -> dict[str, Any]:
         path = Path(file_path)
         if not path.is_file():
             raise ApiClientError("File does not exist")
 
         file_type = self._file_type(path)
+        estimate_file_type = self._estimate_file_type(file_type, pdf_mode)
         url = f"{self.base_url}/estimate/"
         try:
             with path.open("rb") as file_handle:
@@ -73,7 +85,7 @@ class ApiClient:
                     data={
                         "source_lang": source,
                         "target_lang": target,
-                        "file_type": file_type,
+                        "file_type": estimate_file_type,
                     },
                     timeout=self.timeout,
                 )
@@ -140,6 +152,25 @@ class ApiClient:
         if suffix == ".docx":
             return "docx"
         raise ApiClientError("Only DOCX and PDF files are supported")
+
+    def _upload_url(self, file_type: str, pdf_mode: str) -> str:
+        if file_type == "docx":
+            return f"{self.base_url}/translate/"
+        if self._normalized_pdf_mode(pdf_mode) == PDF_MODE_LAYOUT:
+            return f"{self.base_url}/translate/pdf-layout"
+        return f"{self.base_url}/translate/pdf"
+
+    def _estimate_file_type(self, file_type: str, pdf_mode: str) -> str:
+        if file_type != "pdf":
+            return file_type
+        if self._normalized_pdf_mode(pdf_mode) == PDF_MODE_LAYOUT:
+            return "pdf_layout"
+        return "pdf"
+
+    def _normalized_pdf_mode(self, pdf_mode: str) -> str:
+        if pdf_mode in {PDF_MODE_SIMPLE, PDF_MODE_LAYOUT}:
+            return pdf_mode
+        raise ApiClientError("Unknown PDF mode")
 
     def _content_type(self, file_type: str) -> str:
         if file_type == "pdf":

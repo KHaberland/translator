@@ -111,6 +111,42 @@ def test_api_client_upload_pdf_uses_pdf_endpoint(tmp_path, monkeypatch):
     ]
 
 
+def test_api_client_upload_layout_pdf_uses_layout_endpoint(tmp_path, monkeypatch):
+    pdf_path = tmp_path / "source.pdf"
+    pdf_path.write_bytes(b"pdf")
+    response = _Response(
+        ok=True,
+        status_code=200,
+        payload={"job_id": "job-1", "status": "queued", "file_type": "pdf_layout"},
+    )
+    calls = []
+
+    def fake_post(url, files, data, timeout):
+        file_name, _file_handle, content_type = files["file"]
+        calls.append((url, file_name, content_type, data, timeout))
+        return response
+
+    monkeypatch.setattr(requests, "post", fake_post)
+
+    payload = ApiClient(base_url="http://backend", timeout=5).upload(
+        str(pdf_path),
+        "en",
+        "ru",
+        pdf_mode="layout",
+    )
+
+    assert payload == response._payload
+    assert calls == [
+        (
+            "http://backend/translate/pdf-layout",
+            "source.pdf",
+            "application/pdf",
+            {"source_lang": "en", "target_lang": "ru"},
+            5,
+        )
+    ]
+
+
 def test_api_client_estimate_pdf_sends_file_type(tmp_path, monkeypatch):
     pdf_path = tmp_path / "source.pdf"
     pdf_path.write_bytes(b"pdf")
@@ -146,6 +182,47 @@ def test_api_client_estimate_pdf_sends_file_type(tmp_path, monkeypatch):
             "source.pdf",
             "application/pdf",
             {"source_lang": "en", "target_lang": "ru", "file_type": "pdf"},
+            5,
+        )
+    ]
+
+
+def test_api_client_estimate_layout_pdf_sends_layout_file_type(tmp_path, monkeypatch):
+    pdf_path = tmp_path / "source.pdf"
+    pdf_path.write_bytes(b"pdf")
+    response = _Response(
+        ok=True,
+        status_code=200,
+        payload={
+            "estimated_characters": 3,
+            "estimated_total_tokens": 2,
+            "estimated_cost_usd": 0.0001,
+            "budget_status": "ok",
+        },
+    )
+    calls = []
+
+    def fake_post(url, files, data, timeout):
+        file_name, _file_handle, content_type = files["file"]
+        calls.append((url, file_name, content_type, data, timeout))
+        return response
+
+    monkeypatch.setattr(requests, "post", fake_post)
+
+    payload = ApiClient(base_url="http://backend", timeout=5).estimate(
+        str(pdf_path),
+        "en",
+        "ru",
+        pdf_mode="layout",
+    )
+
+    assert payload == response._payload
+    assert calls == [
+        (
+            "http://backend/estimate/",
+            "source.pdf",
+            "application/pdf",
+            {"source_lang": "en", "target_lang": "ru", "file_type": "pdf_layout"},
             5,
         )
     ]

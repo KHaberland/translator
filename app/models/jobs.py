@@ -10,9 +10,12 @@ from app.models.schemas import LanguageCode
 class JobStatus(StrEnum):
     QUEUED = "queued"
     PARSING = "parsing"
+    EXTRACTING_LAYOUT = "extracting_layout"
+    EXTRACTING_TEXT = "extracting_text"
     ESTIMATING = "estimating"
     TRANSLATING = "translating"
     BUILDING = "building"
+    REBUILDING_PDF = "rebuilding_pdf"
     COMPLETED = "completed"
     FAILED = "failed"
 

@@ -159,9 +159,12 @@ def _default_message(stage: str) -> str:
     messages = {
         "queued": "Job queued",
         "parsing": "Parsing document",
+        "extracting_layout": "Extracting PDF layout",
+        "extracting_text": "Extracting text",
         "estimating": "Estimating translation cost",
         "translating": "Translating document",
         "building": "Building document",
+        "rebuilding_pdf": "Rebuilding PDF",
         "completed": "Completed",
         "failed": "Failed",
     }

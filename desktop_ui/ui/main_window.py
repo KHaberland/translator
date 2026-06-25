@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from desktop_ui.core.api_client import PDF_MODE_LAYOUT, PDF_MODE_SIMPLE
 from desktop_ui.core.worker import DownloadWorker, EstimateWorker, PollingWorker, UploadWorker
 
 
@@ -31,7 +32,7 @@ class MainWindow(QMainWindow):
         self.current_job_id: str | None = None
         self.result_file: str | None = None
         self.last_estimate: dict | None = None
-        self.last_estimate_context: tuple[str, str, str] | None = None
+        self.last_estimate_context: tuple[str, str, str, str] | None = None
         self.estimate_worker: EstimateWorker | None = None
         self.upload_worker: UploadWorker | None = None
         self.polling_worker: PollingWorker | None = None
@@ -52,6 +53,10 @@ class MainWindow(QMainWindow):
         self.target_language_combo = QComboBox()
         self.target_language_combo.addItems(LANGUAGES)
         self.target_language_combo.setCurrentText("ru")
+
+        self.pdf_mode_combo = QComboBox()
+        self.pdf_mode_combo.addItem("Simple PDF", PDF_MODE_SIMPLE)
+        self.pdf_mode_combo.addItem("Layout PDF", PDF_MODE_LAYOUT)
 
         self.translate_button = QPushButton("Translate")
         self.translate_button.setEnabled(False)
@@ -88,6 +93,7 @@ class MainWindow(QMainWindow):
         form_layout = QFormLayout()
         form_layout.addRow("Source language", self.source_language_combo)
         form_layout.addRow("Target language", self.target_language_combo)
+        form_layout.addRow("PDF mode", self.pdf_mode_combo)
         form_layout.addRow("Job ID", self.job_id_value_label)
         form_layout.addRow("Status", self.status_value_label)
 
@@ -106,6 +112,7 @@ class MainWindow(QMainWindow):
         self.select_file_button.clicked.connect(self._select_document)
         self.source_language_combo.currentTextChanged.connect(self._handle_language_change)
         self.target_language_combo.currentTextChanged.connect(self._handle_language_change)
+        self.pdf_mode_combo.currentIndexChanged.connect(self._handle_pdf_mode_change)
         self.estimate_button.clicked.connect(self._start_estimate)
         self.translate_button.clicked.connect(self._start_upload)
         self.download_button.clicked.connect(self._download_result)
@@ -138,6 +145,11 @@ class MainWindow(QMainWindow):
         self.last_estimate_context = None
         self._update_validation()
 
+    def _handle_pdf_mode_change(self, *_args: object) -> None:
+        self.last_estimate = None
+        self.last_estimate_context = None
+        self._update_validation()
+
     def _update_validation(self, *_args: object) -> None:
         selected_path = Path(self.selected_file_path) if self.selected_file_path else None
         has_valid_document = (
@@ -148,10 +160,14 @@ class MainWindow(QMainWindow):
             self.source_language_combo.currentText()
             != self.target_language_combo.currentText()
         )
+        has_pdf_document = (
+            selected_path is not None and selected_path.suffix.lower() == ".pdf"
+        )
 
         can_start = has_valid_document and languages_are_different
         self.estimate_button.setEnabled(can_start)
         self.translate_button.setEnabled(can_start)
+        self.pdf_mode_combo.setEnabled(has_pdf_document)
 
         if selected_path is None:
             self.message_label.setText("Select a DOCX or PDF file to continue")
@@ -176,6 +192,7 @@ class MainWindow(QMainWindow):
             file_path=self.selected_file_path,
             source_language=self.source_language_combo.currentText(),
             target_language=self.target_language_combo.currentText(),
+            pdf_mode=self._selected_pdf_mode(),
             parent=self,
         )
         self.estimate_worker.started_signal.connect(self._set_estimating_state)
@@ -188,6 +205,7 @@ class MainWindow(QMainWindow):
         self.select_file_button.setEnabled(False)
         self.source_language_combo.setEnabled(False)
         self.target_language_combo.setEnabled(False)
+        self.pdf_mode_combo.setEnabled(False)
         self.estimate_button.setEnabled(False)
         self.translate_button.setEnabled(False)
 
@@ -225,6 +243,7 @@ class MainWindow(QMainWindow):
             file_path=self.selected_file_path,
             source_language=self.source_language_combo.currentText(),
             target_language=self.target_language_combo.currentText(),
+            pdf_mode=self._selected_pdf_mode(),
             parent=self,
         )
         self.upload_worker.started_signal.connect(self._set_uploading_state)
@@ -237,6 +256,7 @@ class MainWindow(QMainWindow):
         self.select_file_button.setEnabled(False)
         self.source_language_combo.setEnabled(False)
         self.target_language_combo.setEnabled(False)
+        self.pdf_mode_combo.setEnabled(False)
         self.estimate_button.setEnabled(False)
         self.translate_button.setEnabled(False)
 
@@ -418,14 +438,21 @@ class MainWindow(QMainWindow):
             f"Status: {status}"
         )
 
-    def _current_estimate_context(self) -> tuple[str, str, str] | None:
+    def _current_estimate_context(self) -> tuple[str, str, str, str] | None:
         if self.selected_file_path is None:
             return None
         return (
             self.selected_file_path,
             self.source_language_combo.currentText(),
             self.target_language_combo.currentText(),
+            self._selected_pdf_mode(),
         )
+
+    def _selected_pdf_mode(self) -> str:
+        mode = self.pdf_mode_combo.currentData()
+        if mode in {PDF_MODE_SIMPLE, PDF_MODE_LAYOUT}:
+            return str(mode)
+        return PDF_MODE_SIMPLE
 
     def _confirm_budget_if_needed(self) -> bool:
         if (

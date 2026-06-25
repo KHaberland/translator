@@ -16,7 +16,7 @@ from redis.exceptions import RedisError
 from app.api.download import get_translation_download
 from app.api.estimate import estimate_docx
 from app.api.status import get_translation_status
-from app.api.translate import translate_docx, translate_pdf
+from app.api.translate import translate_docx, translate_pdf, translate_pdf_layout
 from app.core.cache import RedisTranslationCache, build_cache_key
 from app.core.config import Settings
 from app.core.job_store import InMemoryJobStore
@@ -28,8 +28,15 @@ from app.services.builder import build_translated_docx
 from app.services.cost_estimator import estimate_translation_cost
 from app.services.docx_parser import extract_docx_blocks
 from app.services.pdf.builder import build_pdf
+from app.services.pdf.fit_engine import FittedText, fit_text
+from app.services.pdf.layout_builder import build_translated_pdf
 from app.services.pdf.layout_parser import PDFTextBlock, extract_pdf_layout_blocks
 from app.services.pdf.parser import extract_pdf_blocks
+from app.services.pdf.translator import (
+    pdf_text_blocks_to_document_blocks,
+    translate_pdf_layout_file,
+    translate_pdf_text_blocks,
+)
 from app.services.price_estimator import (
     budget_status,
     estimate_output_tokens,
@@ -39,7 +46,11 @@ from app.services.segmenter import build_translation_batches
 from app.services.translator import DocumentProcessingError, translate_docx_file
 from app.services.translation_cache import TranslationCache, normalize_translation_cache_text
 from app.services.translation_memory import SQLiteTranslationMemory
-from workers.translation_worker import process_pdf_translation_job, process_translation_job
+from workers.translation_worker import (
+    process_pdf_layout_translation_job,
+    process_pdf_translation_job,
+    process_translation_job,
+)
 
 
 def test_extract_docx_blocks_from_paragraphs_and_tables(tmp_path):
@@ -104,6 +115,20 @@ def test_extract_pdf_layout_blocks_uses_line_level_metadata(tmp_path):
     assert blocks[0].translatable is True
 
 
+def test_extract_pdf_layout_blocks_filters_empty_lines(tmp_path):
+    source_path = tmp_path / "layout-empty-lines.pdf"
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_text((72, 72), "First line\n   \nSecond line", fontsize=12)
+    document.save(source_path)
+    document.close()
+
+    blocks = extract_pdf_layout_blocks(source_path)
+
+    assert [block.text for block in blocks] == ["First line", "Second line"]
+    assert all(block.text.strip() for block in blocks)
+
+
 def test_extract_pdf_layout_blocks_marks_technical_lines_non_translatable(tmp_path):
     source_path = tmp_path / "layout-technical.pdf"
     document = fitz.open()
@@ -133,6 +158,256 @@ def test_extract_pdf_layout_blocks_marks_technical_lines_non_translatable(tmp_pa
         False,
         False,
     ]
+
+
+def test_pdf_text_blocks_to_document_blocks_keeps_only_translation_fields():
+    blocks = [
+        PDFTextBlock(
+            block_id="p0l1",
+            text="Hello layout",
+            page=0,
+            bbox=(72.0, 72.0, 200.0, 90.0),
+            font_size=12.0,
+            font_name="Helvetica",
+            translatable=True,
+        ),
+        PDFTextBlock(
+            block_id="p0l2",
+            text="WPS-001",
+            page=0,
+            bbox=(72.0, 96.0, 160.0, 110.0),
+            font_size=9.0,
+            font_name=None,
+            translatable=False,
+        ),
+    ]
+
+    document_blocks = pdf_text_blocks_to_document_blocks(blocks)
+
+    assert [block.block_id for block in document_blocks] == ["p0l1", "p0l2"]
+    assert [block.text for block in document_blocks] == ["Hello layout", "WPS-001"]
+    assert [block.translatable for block in document_blocks] == [True, False]
+    assert [block.location for block in document_blocks] == [
+        "pdf_layout:p0l1",
+        "pdf_layout:p0l2",
+    ]
+    assert all(block.metadata == {} for block in document_blocks)
+
+
+def test_translate_pdf_text_blocks_reuses_common_translation_pipeline(tmp_path, monkeypatch):
+    blocks = [
+        PDFTextBlock(
+            block_id="p0l1",
+            text="Hello",
+            page=0,
+            bbox=(72.0, 72.0, 200.0, 90.0),
+            font_size=12.0,
+            font_name="Helvetica",
+            translatable=True,
+        ),
+        PDFTextBlock(
+            block_id="p0l2",
+            text="Hello",
+            page=0,
+            bbox=(72.0, 96.0, 200.0, 114.0),
+            font_size=12.0,
+            font_name="Helvetica",
+            translatable=True,
+        ),
+        PDFTextBlock(
+            block_id="p0l3",
+            text="Cached",
+            page=0,
+            bbox=(72.0, 120.0, 200.0, 138.0),
+            font_size=12.0,
+            font_name="Helvetica",
+            translatable=True,
+        ),
+        PDFTextBlock(
+            block_id="p0l4",
+            text="WPS-001",
+            page=0,
+            bbox=(72.0, 144.0, 200.0, 162.0),
+            font_size=12.0,
+            font_name="Helvetica",
+            translatable=False,
+        ),
+    ]
+    cache = _PipelineCache({"Cached": "Из кеша"})
+    client = _FakeTranslationClient({"p0l1": "Привет"})
+    memory_path = tmp_path / "memory.sqlite3"
+
+    monkeypatch.setattr("app.services.translator.get_translation_cache", lambda settings: cache)
+    monkeypatch.setattr("app.services.translator.get_translation_client", lambda settings: client)
+
+    translations = asyncio.run(
+        translate_pdf_text_blocks(
+            blocks=blocks,
+            document_name="layout.pdf",
+            source_lang=LanguageCode.EN,
+            target_lang=LanguageCode.RU,
+            settings=Settings(
+                mock_ai_enabled=False,
+                upload_dir=tmp_path / "uploads",
+                output_dir=tmp_path / "outputs",
+                tmp_dir=tmp_path / "tmp",
+                translation_memory_db_path=memory_path,
+            ),
+        )
+    )
+
+    memory = SQLiteTranslationMemory(memory_path)
+    assert translations == {
+        "p0l1": "Привет",
+        "p0l2": "Привет",
+        "p0l3": "Из кеша",
+    }
+    assert client.requested_block_ids == [["p0l1"]]
+    assert cache.stored == [
+        (build_cache_key("Hello", LanguageCode.EN, LanguageCode.RU), "Привет")
+    ]
+    assert memory.lookup_exact("Hello", LanguageCode.EN, LanguageCode.RU) == "Привет"
+
+
+def test_translate_pdf_layout_file_runs_layout_pipeline_with_progress(tmp_path, monkeypatch):
+    source_path = tmp_path / "source.pdf"
+    output_dir = tmp_path / "outputs"
+    document = fitz.open()
+    document.new_page().insert_text((72, 72), "Hello layout", fontsize=12)
+    document.save(source_path)
+    document.close()
+    progress_events = []
+
+    monkeypatch.setattr(
+        "app.services.translator.get_translation_cache",
+        lambda settings: _PipelineCache({}),
+    )
+
+    result = asyncio.run(
+        translate_pdf_layout_file(
+            source_path=source_path,
+            original_filename="source.pdf",
+            source_lang=LanguageCode.EN,
+            target_lang=LanguageCode.RU,
+            settings=Settings(
+                mock_ai_enabled=True,
+                output_dir=output_dir,
+                upload_dir=tmp_path / "uploads",
+                tmp_dir=tmp_path / "tmp",
+                translation_memory_db_path=tmp_path / "memory.sqlite3",
+            ),
+            progress_callback=lambda status, progress, message: progress_events.append(
+                (status, progress, message)
+            ),
+        )
+    )
+
+    assert result.status == "completed"
+    assert result.file_name == "source_translated_to_ru.pdf"
+    assert result.file_path.is_file()
+    assert result.estimated_characters == len("Hello layout")
+    assert [event[0] for event in progress_events] == [
+        "extracting_layout",
+        "extracting_text",
+        "extracting_text",
+        "translating",
+        "translating",
+        "rebuilding_pdf",
+        "completed",
+    ]
+
+    translated_pdf = fitz.open(result.file_path)
+    try:
+        text = "\n".join(page.get_text() for page in translated_pdf)
+    finally:
+        translated_pdf.close()
+
+    assert "Hello layout [ru]" in " ".join(text.split())
+
+
+def test_translate_pdf_layout_file_wraps_layout_parse_errors(tmp_path, monkeypatch):
+    source_path = tmp_path / "broken.pdf"
+    source_path.write_bytes(b"not a pdf")
+
+    monkeypatch.setattr(
+        "app.services.pdf.translator.extract_pdf_layout_blocks",
+        lambda path: (_ for _ in ()).throw(ValueError("parse failed")),
+    )
+
+    with pytest.raises(DocumentProcessingError, match="failed to parse PDF layout file"):
+        asyncio.run(
+            translate_pdf_layout_file(
+                source_path=source_path,
+                original_filename="broken.pdf",
+                source_lang=LanguageCode.EN,
+                target_lang=LanguageCode.RU,
+                settings=Settings(
+                    output_dir=tmp_path / "outputs",
+                    upload_dir=tmp_path / "uploads",
+                    tmp_dir=tmp_path / "tmp",
+                    translation_memory_db_path=tmp_path / "memory.sqlite3",
+                ),
+            )
+        )
+
+
+def test_translate_pdf_layout_file_wraps_rebuild_errors(tmp_path, monkeypatch):
+    source_path = tmp_path / "source.pdf"
+    document = fitz.open()
+    document.new_page().insert_text((72, 72), "Hello layout", fontsize=12)
+    document.save(source_path)
+    document.close()
+
+    monkeypatch.setattr(
+        "app.services.pdf.translator.build_translated_pdf",
+        lambda **kwargs: (_ for _ in ()).throw(ValueError("build failed")),
+    )
+
+    with pytest.raises(DocumentProcessingError, match="failed to build translated PDF layout file"):
+        asyncio.run(
+            translate_pdf_layout_file(
+                source_path=source_path,
+                original_filename="source.pdf",
+                source_lang=LanguageCode.EN,
+                target_lang=LanguageCode.RU,
+                settings=Settings(
+                    mock_ai_enabled=True,
+                    output_dir=tmp_path / "outputs",
+                    upload_dir=tmp_path / "uploads",
+                    tmp_dir=tmp_path / "tmp",
+                    translation_memory_db_path=tmp_path / "memory.sqlite3",
+                ),
+            )
+        )
+
+
+def test_fit_text_normalizes_whitespace_and_keeps_font_when_text_fits():
+    fitted = fit_text(" Hello   PDF\nlayout ", (0.0, 0.0, 220.0, 40.0), 12.0)
+
+    assert fitted == FittedText(
+        text="Hello PDF layout",
+        font_size=12.0,
+        overflow=False,
+    )
+
+
+def test_fit_text_reduces_font_size_to_fit_box():
+    fitted = fit_text("Hello PDF", (0.0, 0.0, 100.0, 10.0), 12.0)
+
+    assert fitted.text == "Hello PDF"
+    assert 6.0 <= fitted.font_size < 12.0
+    assert fitted.overflow is False
+
+
+def test_fit_text_returns_overflow_when_text_does_not_fit_at_minimum_size():
+    fitted = fit_text(
+        "Very long translated paragraph that cannot fit into this tiny box",
+        (0.0, 0.0, 20.0, 7.0),
+        12.0,
+    )
+
+    assert fitted.font_size == 6.0
+    assert fitted.overflow is True
 
 
 def test_build_pdf_writes_blocks_to_output_pdf(tmp_path):
@@ -177,6 +452,83 @@ def test_build_pdf_adds_pages_when_content_exceeds_page_height(tmp_path):
 
     assert "Translated paragraph 1" in text
     assert "Translated paragraph 79" in text
+
+
+def test_build_translated_pdf_overlays_translations_and_preserves_pages(tmp_path):
+    source_path = tmp_path / "source.pdf"
+    output_path = tmp_path / "outputs" / "translated.pdf"
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_text((72, 72), "Hello PDF layout area", fontsize=12)
+    document.new_page().insert_text((72, 72), "Second page", fontsize=12)
+    document.save(source_path)
+    document.close()
+    blocks = extract_pdf_layout_blocks(source_path)
+
+    build_translated_pdf(source_path, output_path, blocks, {"p0l1": "Привет PDF"})
+
+    assert output_path.is_file()
+
+    translated_document = fitz.open(output_path)
+    try:
+        assert translated_document.page_count == 2
+        text = "\n".join(page.get_text() for page in translated_document)
+    finally:
+        translated_document.close()
+
+    assert "Привет PDF" in " ".join(text.split())
+    assert "Second page" in text
+
+
+def test_build_translated_pdf_uses_fitted_text_and_font_size(tmp_path, monkeypatch):
+    source_path = tmp_path / "source.pdf"
+    output_path = tmp_path / "outputs" / "translated.pdf"
+    document = fitz.open()
+    document.new_page().insert_text((72, 72), "Hello PDF layout area", fontsize=12)
+    document.save(source_path)
+    document.close()
+    blocks = extract_pdf_layout_blocks(source_path)
+    calls = []
+
+    def fake_fit_text(text, bbox, font_size):
+        calls.append((text, bbox, font_size))
+        return FittedText(text="Fitted PDF", font_size=7.0, overflow=False)
+
+    monkeypatch.setattr("app.services.pdf.layout_builder.fit_text", fake_fit_text)
+
+    build_translated_pdf(source_path, output_path, blocks, {"p0l1": "Translated PDF"})
+
+    translated_document = fitz.open(output_path)
+    try:
+        text = translated_document[0].get_text()
+    finally:
+        translated_document.close()
+
+    assert calls == [("Translated PDF", blocks[0].bbox, blocks[0].font_size)]
+    assert "Fitted PDF" in " ".join(text.split())
+
+
+def test_build_translated_pdf_preserves_source_images(tmp_path):
+    source_path = tmp_path / "source-with-image.pdf"
+    output_path = tmp_path / "outputs" / "translated.pdf"
+    document = fitz.open()
+    page = document.new_page()
+    image = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 1, 1), False)
+    image.clear_with(0xFF0000)
+    page.insert_image(fitz.Rect(72, 120, 92, 140), pixmap=image)
+    page.insert_text((72, 72), "Image caption", fontsize=12)
+    document.save(source_path)
+    document.close()
+    blocks = extract_pdf_layout_blocks(source_path)
+
+    build_translated_pdf(source_path, output_path, blocks, {"p0l1": "Подпись"})
+
+    translated_document = fitz.open(output_path)
+    try:
+        assert len(translated_document[0].get_images(full=True)) == 1
+        assert "Подпись" in translated_document[0].get_text()
+    finally:
+        translated_document.close()
 
 
 def test_build_translated_docx_replaces_paragraphs_and_table_cells(tmp_path):
@@ -489,6 +841,74 @@ def test_estimate_endpoint_accepts_pdf_and_uses_pdf_parser(tmp_path, monkeypatch
     assert response.estimated_input_tokens == 3
     assert response.estimated_output_tokens == 4
     assert response.estimated_total_tokens == 7
+    assert response.estimated_cost_usd > 0
+    assert response.budget_status == "ok"
+
+
+def test_estimate_endpoint_accepts_pdf_layout_and_deduplicates_blocks(
+    tmp_path,
+    monkeypatch,
+):
+    pdf_path = tmp_path / "estimate-layout.pdf"
+    document = fitz.open()
+    document.new_page().insert_text((72, 72), "Hello layout")
+    document.save(pdf_path)
+    document.close()
+    file = _UploadFileStub(
+        filename="estimate-layout.pdf",
+        content_type="application/pdf",
+        content=pdf_path.read_bytes(),
+    )
+
+    monkeypatch.setattr(
+        "app.api.estimate.get_settings",
+        lambda: Settings(
+            tmp_dir=tmp_path / "tmp",
+            translation_budget_usd=10,
+            estimated_output_token_multiplier=1.2,
+            translation_memory_db_path=tmp_path / "memory.sqlite3",
+        ),
+    )
+    monkeypatch.setattr(
+        "app.api.estimate.extract_docx_blocks",
+        lambda path: pytest.fail("PDF layout estimate should not use DOCX parser"),
+    )
+    monkeypatch.setattr(
+        "app.api.estimate.extract_pdf_blocks",
+        lambda path: pytest.fail("PDF layout estimate should not use simple PDF parser"),
+    )
+    monkeypatch.setattr(
+        "app.api.estimate.extract_pdf_layout_blocks",
+        lambda path: [
+            _pdf_text_block("p0l1", "Hello layout"),
+            _pdf_text_block("p0l2", "  Hello   layout  "),
+            _pdf_text_block("p0l3", "Another line"),
+            _pdf_text_block("p0l4", "WPS-001", translatable=False),
+            _pdf_text_block("p0l5", ""),
+        ],
+    )
+    monkeypatch.setattr(
+        "app.api.estimate.get_translation_client",
+        lambda settings: pytest.fail("estimate should not call OpenAI"),
+        raising=False,
+    )
+
+    response = asyncio.run(
+        estimate_docx(
+            file=file,
+            source_lang=LanguageCode.EN,
+            target_lang=LanguageCode.RU,
+            file_type="pdf_layout",
+        )
+    )
+
+    assert response.file_name == "estimate-layout.pdf"
+    assert response.translatable_blocks == 2
+    assert response.skipped_blocks == 3
+    assert response.estimated_characters == len("Hello layout") + len("Another line")
+    assert response.estimated_input_tokens == 6
+    assert response.estimated_output_tokens == 8
+    assert response.estimated_total_tokens == 14
     assert response.estimated_cost_usd > 0
     assert response.budget_status == "ok"
 
@@ -894,6 +1314,54 @@ def test_translate_pdf_endpoint_creates_separate_queued_pdf_job(tmp_path, monkey
     assert enqueued_job_ids == [response.job_id]
 
 
+def test_translate_pdf_layout_endpoint_creates_separate_layout_job(tmp_path, monkeypatch):
+    store = InMemoryJobStore()
+    enqueued_job_ids: list[str] = []
+    upload_dir = tmp_path / "uploads"
+    pdf_path = tmp_path / "layout.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n%test\n")
+    file = _UploadFileStub(
+        filename="layout.pdf",
+        content_type="application/pdf",
+        content=pdf_path.read_bytes(),
+    )
+
+    monkeypatch.setattr(
+        "app.api.translate.get_settings",
+        lambda: Settings(
+            mock_ai_enabled=True,
+            upload_dir=upload_dir,
+            output_dir=tmp_path / "outputs",
+            tmp_dir=tmp_path / "tmp",
+            translation_memory_db_path=tmp_path / "memory.sqlite3",
+        ),
+    )
+    monkeypatch.setattr("app.api.translate.get_job_store", lambda: store)
+    monkeypatch.setattr(
+        "app.api.translate._enqueue_pdf_layout_translation_job",
+        lambda job_id: enqueued_job_ids.append(job_id),
+    )
+
+    response = asyncio.run(
+        translate_pdf_layout(
+            file=file,
+            source_lang=LanguageCode.EN,
+            target_lang=LanguageCode.RU,
+        )
+    )
+
+    stored_job = store.get_job(response.job_id)
+    assert response.status == JobStatus.QUEUED
+    assert response.file_type == "pdf_layout"
+    assert stored_job is not None
+    assert stored_job.status == JobStatus.QUEUED
+    assert stored_job.progress == 0
+    assert stored_job.file_type == "pdf_layout"
+    assert stored_job.original_filename == "layout.pdf"
+    assert stored_job.upload_path.startswith(upload_dir.as_posix())
+    assert enqueued_job_ids == [response.job_id]
+
+
 def test_translate_pdf_endpoint_rejects_non_pdf_file():
     file = SimpleNamespace(filename="document.docx", content_type="application/pdf")
 
@@ -916,6 +1384,38 @@ def test_translate_pdf_endpoint_rejects_invalid_pdf_content_type():
     with pytest.raises(HTTPException) as exc_info:
         asyncio.run(
             translate_pdf(
+                file=file,
+                source_lang=LanguageCode.EN,
+                target_lang=LanguageCode.RU,
+            )
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "invalid PDF content type"
+
+
+def test_translate_pdf_layout_endpoint_rejects_non_pdf_file():
+    file = SimpleNamespace(filename="document.docx", content_type="application/pdf")
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            translate_pdf_layout(
+                file=file,
+                source_lang=LanguageCode.EN,
+                target_lang=LanguageCode.RU,
+            )
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "only PDF files are supported"
+
+
+def test_translate_pdf_layout_endpoint_rejects_invalid_pdf_content_type():
+    file = SimpleNamespace(filename="document.pdf", content_type="text/plain")
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            translate_pdf_layout(
                 file=file,
                 source_lang=LanguageCode.EN,
                 target_lang=LanguageCode.RU,
@@ -1040,6 +1540,28 @@ def test_download_endpoint_returns_pdf_result(tmp_path, monkeypatch):
     assert response.path == result_path
     assert response.media_type == "application/pdf"
     assert response.filename == "translated.pdf"
+
+
+def test_download_endpoint_returns_pdf_layout_result(tmp_path, monkeypatch):
+    store = InMemoryJobStore()
+    result_path = tmp_path / "translated-layout.pdf"
+    result_path.write_bytes(b"%PDF-1.4\n")
+    store.create_job(
+        _job(
+            "job-download-pdf-layout",
+            status=JobStatus.COMPLETED,
+            progress=100,
+            result_file=result_path.as_posix(),
+            file_type="pdf_layout",
+        )
+    )
+    monkeypatch.setattr("app.api.download.get_job_store", lambda: store)
+
+    response = get_translation_download("job-download-pdf-layout")
+
+    assert response.path == result_path
+    assert response.media_type == "application/pdf"
+    assert response.filename == "translated-layout.pdf"
 
 
 def test_download_endpoint_returns_404_for_missing_job(monkeypatch):
@@ -1272,6 +1794,54 @@ def test_worker_processes_pdf_translation_job_with_mock_ai(tmp_path, monkeypatch
     assert "Hello PDF [ru]" in text
 
 
+def test_worker_processes_pdf_layout_translation_job_with_mock_ai(tmp_path, monkeypatch):
+    store = InMemoryJobStore()
+    source_path = tmp_path / "worker-layout.pdf"
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_text((72, 72), "Hello layout PDF")
+    document.save(source_path)
+    document.close()
+    job = TranslationJob(
+        job_id="job-pdf-layout-worker",
+        source_lang=LanguageCode.EN,
+        target_lang=LanguageCode.RU,
+        original_filename="worker-layout.pdf",
+        upload_path=source_path.as_posix(),
+        file_type="pdf_layout",
+    )
+    store.create_job(job)
+
+    monkeypatch.setattr("workers.translation_worker.get_job_store", lambda: store)
+    monkeypatch.setattr(
+        "workers.translation_worker.get_settings",
+        lambda: Settings(
+            mock_ai_enabled=True,
+            upload_dir=tmp_path / "uploads",
+            output_dir=tmp_path / "outputs",
+            tmp_dir=tmp_path / "tmp",
+            translation_memory_db_path=tmp_path / "memory.sqlite3",
+        ),
+    )
+
+    process_pdf_layout_translation_job("job-pdf-layout-worker")
+
+    completed_job = store.get_job("job-pdf-layout-worker")
+    assert completed_job is not None
+    assert completed_job.status == JobStatus.COMPLETED
+    assert completed_job.progress == 100
+    assert completed_job.result_file is not None
+    assert completed_job.result_file.endswith(".pdf")
+
+    translated_pdf = fitz.open(completed_job.result_file)
+    try:
+        text = "\n".join(page.get_text() for page in translated_pdf)
+    finally:
+        translated_pdf.close()
+
+    assert "Hello layout PDF [ru]" in " ".join(text.split())
+
+
 def test_worker_failed_job_stores_safe_error(tmp_path, monkeypatch):
     store = InMemoryJobStore()
     job = TranslationJob(
@@ -1311,6 +1881,22 @@ def _block(block_id: str, text: str, translatable: bool = True) -> DocumentBlock
         block_id=block_id,
         text=text,
         location=f"test:{block_id}",
+        translatable=translatable,
+    )
+
+
+def _pdf_text_block(
+    block_id: str,
+    text: str,
+    translatable: bool = True,
+) -> PDFTextBlock:
+    return PDFTextBlock(
+        block_id=block_id,
+        text=text,
+        page=0,
+        bbox=(72.0, 72.0, 200.0, 90.0),
+        font_size=12.0,
+        font_name="Helvetica",
         translatable=translatable,
     )
 

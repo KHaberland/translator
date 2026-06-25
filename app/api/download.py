@@ -44,6 +44,6 @@ def get_translation_download(job_id: str) -> FileResponse:
 
 
 def _media_type_for_job(file_type: str) -> str:
-    if file_type == "pdf":
+    if file_type in {"pdf", "pdf_layout"}:
         return PDF_MEDIA_TYPE
     return DOCX_MEDIA_TYPE

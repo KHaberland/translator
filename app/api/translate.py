@@ -9,6 +9,7 @@ from app.core.job_store import get_job_store
 from app.models.jobs import TranslationJob
 from app.models.schemas import (
     LanguageCode,
+    PdfLayoutTranslateJobResponse,
     PdfTranslateJobResponse,
     TranslateJobResponse,
     TranslateResponse,
@@ -117,6 +118,56 @@ async def translate_pdf(
 
     logger.info("translation status=queued job_id=%s file=%s", job_id, upload_path.name)
     return PdfTranslateJobResponse(
+        job_id=job_id,
+        status=job.status,
+        file_type=job.file_type,
+    )
+
+
+@router.post("/pdf-layout", response_model=PdfLayoutTranslateJobResponse)
+async def translate_pdf_layout(
+    file: UploadFile = File(...),
+    source_lang: LanguageCode = Form(...),
+    target_lang: LanguageCode = Form(...),
+) -> PdfLayoutTranslateJobResponse:
+    if source_lang == target_lang:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="source_lang and target_lang must be different",
+        )
+
+    _validate_pdf_file(file)
+
+    settings = get_settings()
+    content = await file.read()
+    upload_path = _save_uploaded_file(
+        content=content,
+        filename=file.filename or "document.pdf",
+        max_file_size_bytes=settings.max_file_size_bytes,
+    )
+
+    job_id = uuid4().hex
+    job = TranslationJob(
+        job_id=job_id,
+        source_lang=source_lang,
+        target_lang=target_lang,
+        original_filename=file.filename or upload_path.name,
+        upload_path=upload_path.as_posix(),
+        file_type="pdf_layout",
+    )
+
+    try:
+        get_job_store().create_job(job)
+        _enqueue_pdf_layout_translation_job(job_id)
+    except Exception as exc:
+        logger.warning("translation status=failed file=%s reason=queue", upload_path.name)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="translation queue is unavailable",
+        ) from exc
+
+    logger.info("translation status=queued job_id=%s file=%s", job_id, upload_path.name)
+    return PdfLayoutTranslateJobResponse(
         job_id=job_id,
         status=job.status,
         file_type=job.file_type,
@@ -242,3 +293,9 @@ def _enqueue_pdf_translation_job(job_id: str) -> None:
     from workers.translation_worker import run_pdf_translation_job
 
     run_pdf_translation_job.delay(job_id)
+
+
+def _enqueue_pdf_layout_translation_job(job_id: str) -> None:
+    from workers.translation_worker import run_pdf_layout_translation_job
+
+    run_pdf_layout_translation_job.delay(job_id)
