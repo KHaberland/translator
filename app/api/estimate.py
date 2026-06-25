@@ -1,14 +1,16 @@
 import logging
 from pathlib import Path
+from typing import Literal
 from uuid import uuid4
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
 
-from app.api.translate import _validate_docx_file
+from app.api.translate import _validate_docx_file, _validate_pdf_file
 from app.core.config import get_settings
 from app.models.schemas import EstimateResponse, LanguageCode
 from app.services.cost_estimator import estimate_translation_cost
 from app.services.docx_parser import extract_docx_blocks
+from app.services.pdf.parser import extract_pdf_blocks
 from app.services.price_estimator import (
     budget_status,
     estimate_output_tokens,
@@ -24,6 +26,7 @@ async def estimate_docx(
     file: UploadFile = File(...),
     source_lang: LanguageCode = Form(...),
     target_lang: LanguageCode = Form(...),
+    file_type: Literal["docx", "pdf"] = Form("docx"),
 ) -> EstimateResponse:
     if source_lang == target_lang:
         raise HTTPException(
@@ -31,7 +34,10 @@ async def estimate_docx(
             detail="source_lang and target_lang must be different",
         )
 
-    _validate_docx_file(file)
+    if file_type == "pdf":
+        _validate_pdf_file(file)
+    else:
+        _validate_docx_file(file)
 
     settings = get_settings()
     content = await file.read()
@@ -42,12 +48,19 @@ async def estimate_docx(
     )
 
     try:
-        blocks = extract_docx_blocks(tmp_path)
+        if file_type == "pdf":
+            blocks = extract_pdf_blocks(tmp_path)
+        else:
+            blocks = extract_docx_blocks(tmp_path)
     except Exception as exc:
-        logger.warning("estimate status=failed file=%s reason=document_processing", tmp_path.name)
+        logger.warning(
+            "estimate status=failed file=%s file_type=%s reason=document_processing",
+            tmp_path.name,
+            file_type,
+        )
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="failed to process DOCX file",
+            detail=f"failed to process {file_type.upper()} file",
         ) from exc
     finally:
         tmp_path.unlink(missing_ok=True)
@@ -63,8 +76,9 @@ async def estimate_docx(
     skipped_blocks = len(blocks) - translatable_blocks
 
     logger.info(
-        "estimate status=ok file=%s characters=%s tokens=%s cost=%s",
+        "estimate status=ok file=%s file_type=%s characters=%s tokens=%s cost=%s",
         file.filename or tmp_path.name,
+        file_type,
         token_estimate.translatable_characters,
         input_tokens + output_tokens,
         cost_usd,

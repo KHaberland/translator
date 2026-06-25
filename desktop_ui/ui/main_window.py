@@ -20,6 +20,7 @@ from desktop_ui.core.worker import DownloadWorker, EstimateWorker, PollingWorker
 
 
 LANGUAGES = ["en", "ru", "lv", "lt", "et"]
+SUPPORTED_EXTENSIONS = {".docx", ".pdf"}
 
 
 class MainWindow(QMainWindow):
@@ -36,10 +37,10 @@ class MainWindow(QMainWindow):
         self.polling_worker: PollingWorker | None = None
         self.download_worker: DownloadWorker | None = None
 
-        self.setWindowTitle("DOCX Translator MVP")
+        self.setWindowTitle("Document Translator MVP")
         self.resize(720, 360)
 
-        self.select_file_button = QPushButton("Select DOCX")
+        self.select_file_button = QPushButton("Select DOCX/PDF")
         self.file_path_label = QLabel("No file selected")
         self.file_path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.file_path_label.setWordWrap(True)
@@ -66,7 +67,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
 
-        self.message_label = QLabel("Select a DOCX file to continue")
+        self.message_label = QLabel("Select a DOCX or PDF file to continue")
         self.message_label.setWordWrap(True)
 
         self.download_button = QPushButton("Download result")
@@ -102,19 +103,19 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central_widget)
 
     def _connect_signals(self) -> None:
-        self.select_file_button.clicked.connect(self._select_docx)
+        self.select_file_button.clicked.connect(self._select_document)
         self.source_language_combo.currentTextChanged.connect(self._handle_language_change)
         self.target_language_combo.currentTextChanged.connect(self._handle_language_change)
         self.estimate_button.clicked.connect(self._start_estimate)
         self.translate_button.clicked.connect(self._start_upload)
         self.download_button.clicked.connect(self._download_result)
 
-    def _select_docx(self) -> None:
+    def _select_document(self) -> None:
         file_path, _ = QFileDialog.getOpenFileName(
             self,
-            "Select DOCX",
+            "Select document",
             "",
-            "Word documents (*.docx);;All files (*.*)",
+            "Documents (*.docx *.pdf);;Word documents (*.docx);;PDF files (*.pdf);;All files (*.*)",
         )
 
         if not file_path:
@@ -139,22 +140,23 @@ class MainWindow(QMainWindow):
 
     def _update_validation(self, *_args: object) -> None:
         selected_path = Path(self.selected_file_path) if self.selected_file_path else None
-        has_valid_docx = (
-            selected_path is not None and selected_path.suffix.lower() == ".docx"
+        has_valid_document = (
+            selected_path is not None
+            and selected_path.suffix.lower() in SUPPORTED_EXTENSIONS
         )
         languages_are_different = (
             self.source_language_combo.currentText()
             != self.target_language_combo.currentText()
         )
 
-        can_start = has_valid_docx and languages_are_different
+        can_start = has_valid_document and languages_are_different
         self.estimate_button.setEnabled(can_start)
         self.translate_button.setEnabled(can_start)
 
         if selected_path is None:
-            self.message_label.setText("Select a DOCX file to continue")
-        elif not has_valid_docx:
-            self.message_label.setText("Only DOCX files are supported")
+            self.message_label.setText("Select a DOCX or PDF file to continue")
+        elif not has_valid_document:
+            self.message_label.setText("Only DOCX and PDF files are supported")
         elif not languages_are_different:
             self.message_label.setText("Source and target languages must be different")
         else:
@@ -217,7 +219,7 @@ class MainWindow(QMainWindow):
         self.status_value_label.setText("uploading")
         self.progress_bar.setValue(0)
         self.download_button.setEnabled(False)
-        self.message_label.setText("Uploading DOCX to backend...")
+        self.message_label.setText("Uploading document to backend...")
 
         self.upload_worker = UploadWorker(
             file_path=self.selected_file_path,
@@ -321,14 +323,15 @@ class MainWindow(QMainWindow):
         default_path = self._default_download_path()
         save_path, _ = QFileDialog.getSaveFileName(
             self,
-            "Save translated DOCX",
+            "Save translated document",
             default_path,
-            "Word documents (*.docx);;All files (*.*)",
+            self._download_file_filter(),
         )
         if not save_path:
             return
-        if Path(save_path).suffix.lower() != ".docx":
-            save_path = f"{save_path}.docx"
+        result_extension = self._result_extension()
+        if Path(save_path).suffix.lower() != result_extension:
+            save_path = f"{save_path}{result_extension}"
 
         self.download_worker = DownloadWorker(
             job_id=self.current_job_id,
@@ -346,11 +349,12 @@ class MainWindow(QMainWindow):
         if self.selected_file_path:
             source_path = Path(self.selected_file_path)
             target_language = self.target_language_combo.currentText()
-            filename = f"{source_path.stem}_translated_to_{target_language}.docx"
+            extension = self._result_extension()
+            filename = f"{source_path.stem}_translated_to_{target_language}{extension}"
         elif self.result_file:
             filename = Path(self.result_file).name
         else:
-            filename = "translated.docx"
+            filename = f"translated{self._result_extension()}"
 
         base_dir = (
             Path(self.selected_file_path).parent
@@ -359,9 +363,25 @@ class MainWindow(QMainWindow):
         )
         return str(base_dir / filename)
 
+    def _result_extension(self) -> str:
+        if self.selected_file_path:
+            suffix = Path(self.selected_file_path).suffix.lower()
+            if suffix in SUPPORTED_EXTENSIONS:
+                return suffix
+        if self.result_file:
+            suffix = Path(self.result_file).suffix.lower()
+            if suffix in SUPPORTED_EXTENSIONS:
+                return suffix
+        return ".docx"
+
+    def _download_file_filter(self) -> str:
+        if self._result_extension() == ".pdf":
+            return "PDF files (*.pdf);;All files (*.*)"
+        return "Word documents (*.docx);;All files (*.*)"
+
     def _set_downloading_state(self) -> None:
         self.download_button.setEnabled(False)
-        self.message_label.setText("Downloading translated DOCX...")
+        self.message_label.setText("Downloading translated document...")
 
     def _handle_download_success(self, saved_path: str) -> None:
         self.download_button.setEnabled(True)
@@ -374,6 +394,7 @@ class MainWindow(QMainWindow):
     def _friendly_worker_error(self, message: str) -> str:
         known_errors = {
             "failed to process DOCX file": "Translation failed",
+            "failed to process PDF file": "Translation failed",
             "translation provider failed": "Translation failed",
             "translation result is not ready": "Result is not ready",
         }

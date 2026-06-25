@@ -11,6 +11,7 @@ router = APIRouter(prefix="/download", tags=["download"])
 DOCX_MEDIA_TYPE = (
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 )
+PDF_MEDIA_TYPE = "application/pdf"
 
 
 @router.get("/{job_id}")
@@ -37,6 +38,12 @@ def get_translation_download(job_id: str) -> FileResponse:
 
     return FileResponse(
         result_path,
-        media_type=DOCX_MEDIA_TYPE,
+        media_type=_media_type_for_job(job.file_type),
         filename=result_path.name,
     )
+
+
+def _media_type_for_job(file_type: str) -> str:
+    if file_type == "pdf":
+        return PDF_MEDIA_TYPE
+    return DOCX_MEDIA_TYPE

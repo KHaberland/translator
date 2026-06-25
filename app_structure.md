@@ -1,17 +1,17 @@
-# Архитектура приложения
+# Структура приложения Translator MVP
 
 ## Назначение
 
-`Translator_MVP` - сервис перевода DOCX-документов с отдельным desktop-клиентом для ручного тестирования полного flow.
+Translator MVP переводит документы DOCX и PDF через backend API, Celery worker и desktop UI. Backend принимает файл, создает задачу перевода, сохраняет состояние в Redis, worker выполняет перевод, а UI показывает прогресс и скачивает результат.
 
-Система состоит из четырех основных частей:
+Система состоит из четырех основных runtime-компонентов:
 
-- FastAPI backend принимает DOCX, считает предварительную оценку стоимости, создает translation job и отдает status/download endpoints.
+- FastAPI backend принимает DOCX/PDF, считает предварительную оценку стоимости, создает translation job и отдает status/download endpoints.
 - Celery worker выполняет перевод в фоне.
-- Redis хранит состояние jobs, Celery broker/result backend, progress events и межзадачный cache переводов.
-- PySide6 desktop UI выбирает DOCX, отправляет файл в backend, опрашивает статус и скачивает готовый результат.
+- Redis/Memurai хранит состояние jobs, Celery broker/result backend, progress events и межзадачный cache переводов.
+- PySide6 desktop UI выбирает DOCX/PDF, отправляет файл в backend, опрашивает статус и скачивает готовый результат.
 
-DOCX pipeline остается в backend-сервисах. Desktop UI не вызывает перевод напрямую и работает только через HTTP API.
+Desktop UI не вызывает перевод напрямую и работает только через HTTP API.
 
 ## Технологический стек
 
@@ -21,8 +21,10 @@ Backend:
 - FastAPI
 - Uvicorn
 - Celery
-- Redis
+- Redis/Memurai
 - python-docx
+- PyMuPDF
+- reportlab
 - SQLite
 - Pydantic
 - pydantic-settings
@@ -68,12 +70,15 @@ Translator_MVP/
 │       ├── segmenter.py
 │       ├── translation_cache.py
 │       ├── translation_memory.py
-│       └── translator.py
+│       ├── translator.py
+│       └── pdf/
+│           ├── __init__.py
+│           ├── builder.py
+│           └── parser.py
 ├── desktop_ui/
 │   ├── __init__.py
 │   ├── config.py
 │   ├── main.py
-│   ├── requirements.txt
 │   ├── core/
 │   │   ├── __init__.py
 │   │   ├── api_client.py
@@ -91,14 +96,12 @@ Translator_MVP/
 ├── uploads/
 ├── outputs/
 ├── tmp/
-├── MANUAL_TESTS.md
-├── PLAN.md
+├── app_structure.md
 ├── plan_upgrade01.md
 ├── plan_upgrade02.md
-├── paln_upgrade02.md
-├── app_structure.md
-├── .env.example
-└── requirements.txt
+├── plan_upgrade03.md
+├── requirements.txt
+└── .env
 ```
 
 `data/`, `uploads/`, `outputs/` и `tmp/` - рабочие директории. Backend создает их при старте через lifespan.
@@ -114,19 +117,19 @@ FastAPI backend
         |
         | create/update job, progress events, cache
         v
-Redis
+Redis/Memurai
         ^
         | broker/result backend
         |
 Celery worker
         |
         v
-DOCX pipeline + OpenAI/Mock AI + SQLite translation memory
+DOCX/PDF pipeline + OpenAI/Mock AI + SQLite translation memory
 ```
 
 Для полного async flow нужны одновременно:
 
-- Redis на `localhost:6379` или другой URL из `.env`;
+- Redis/Memurai на `localhost:6379` или другой URL из `.env`;
 - FastAPI backend;
 - Celery worker;
 - desktop UI.
@@ -148,12 +151,13 @@ DOCX pipeline + OpenAI/Mock AI + SQLite translation memory
 
 ### `app/api/translate.py`
 
-Endpoint-ы загрузки DOCX.
+Endpoint-ы загрузки DOCX и PDF.
 
 Реализовано:
 
-- `POST /translate/` - основной async endpoint;
-- `POST /translate/sync` - синхронный endpoint для локальных проверок и тестов.
+- `POST /translate/` - async endpoint для DOCX;
+- `POST /translate/pdf` - async endpoint для PDF;
+- `POST /translate/sync` - синхронный DOCX endpoint для локальных проверок и тестов.
 
 `POST /translate/`:
 
@@ -164,32 +168,58 @@ Endpoint-ы загрузки DOCX.
 - проверяет MIME/content-type;
 - проверяет размер файла;
 - сохраняет исходный файл в `uploads/`;
-- создает `TranslationJob`;
+- создает `TranslationJob` с `file_type="docx"`;
 - сохраняет job в Redis job store;
 - ставит Celery task `workers.translation_worker.run_translation_job`;
 - возвращает `job_id` и начальный статус.
 
-`POST /translate/sync` выполняет DOCX pipeline сразу в API-процессе и возвращает путь к готовому файлу. Основной UI его не использует.
+`POST /translate/pdf`:
+
+- принимает multipart PDF в поле `file`;
+- принимает `source_lang` и `target_lang`;
+- запрещает одинаковые языки;
+- проверяет расширение `.pdf`;
+- проверяет MIME/content-type `application/pdf`;
+- проверяет размер файла;
+- сохраняет исходный файл в `uploads/`;
+- создает `TranslationJob` с `file_type="pdf"`;
+- сохраняет job в Redis job store;
+- ставит Celery task `workers.translation_worker.run_pdf_translation_job`;
+- возвращает `job_id`, статус и `file_type`.
+
+`POST /translate/sync` выполняет DOCX pipeline сразу в API-процессе. Основной UI его не использует.
 
 ### `app/api/estimate.py`
 
 Endpoint `POST /estimate/`.
 
-Реализует предварительную оценку DOCX без создания translation job и без постановки Celery task.
+Поддерживает DOCX и PDF через form-поле `file_type`.
 
-Поведение:
+Для DOCX:
 
-- принимает multipart DOCX в поле `file`;
+- `file_type=docx`;
+- используется `extract_docx_blocks`.
+
+Для PDF:
+
+- `file_type=pdf`;
+- используется `extract_pdf_blocks`.
+
+Estimate flow:
+
+- принимает multipart файл в поле `file`;
 - принимает `source_lang` и `target_lang`;
 - запрещает одинаковые языки;
-- использует общую DOCX-валидацию upload endpoint-а;
+- валидирует файл по типу;
 - временно сохраняет файл в `tmp/`;
-- извлекает блоки через DOCX parser;
+- извлекает `DocumentBlock`;
 - считает переводимые и пропущенные блоки;
 - оценивает input/output/total tokens;
 - считает примерную стоимость в USD;
 - возвращает бюджет и `budget_status`: `ok` или `exceeded`;
 - удаляет временный файл после обработки.
+
+Estimate не создает job, не ставит Celery task и не вызывает OpenAI.
 
 ### `app/api/status.py`
 
@@ -205,14 +235,19 @@ Endpoint `GET /status/{job_id}`.
 
 ### `app/api/download.py`
 
-Endpoint `GET /download/{job_id}`.
+Endpoint `GET /download/{job_id}` общий для DOCX и PDF.
 
 Поведение:
 
 - если job не найден: `404`;
 - если job не `completed` или `result_file` пустой: `409`;
 - если файл результата отсутствует на диске: `404`;
-- если все корректно: возвращает `FileResponse` с DOCX media type.
+- если все корректно: возвращает `FileResponse`.
+
+Media type выбирается по `job.file_type`:
+
+- `docx` -> `application/vnd.openxmlformats-officedocument.wordprocessingml.document`;
+- `pdf` -> `application/pdf`.
 
 Desktop UI скачивает результат именно через этот endpoint.
 
@@ -228,7 +263,7 @@ Endpoint `GET /stream/{job_id}` для Server-Sent Events.
 - keep-alive сообщения;
 - завершение stream на статусах `completed` и `failed`.
 
-Desktop UI в MVP использует polling через `/status/{job_id}`. SSE остается backend-возможностью и потенциальным v2 для UI.
+Desktop UI в текущем flow использует polling через `/status/{job_id}`. SSE остается backend-возможностью и потенциальным следующим шагом для UI.
 
 ## Backend core
 
@@ -329,6 +364,8 @@ AI-клиент перевода.
 - timeout через настройки;
 - валидацию JSON-ответа и соответствия `block_id`.
 
+Mock-режим возвращает текст вида `source text [target_lang]`. Он нужен только для тестов и локальной проверки pipeline, но не для реального перевода.
+
 ## Models
 
 ### `app/models/schemas.py`
@@ -341,8 +378,9 @@ Pydantic-схемы API и переводимых блоков.
 - `LANGUAGE_NAMES`;
 - `DocumentBlock`;
 - `TranslateResponse`;
-- `EstimateResponse`;
 - `TranslateJobResponse`;
+- `PdfTranslateJobResponse`;
+- `EstimateResponse`;
 - `JobStatusResponse`;
 - `ProgressEvent`.
 
@@ -354,21 +392,26 @@ Pydantic-схемы API и переводимых блоков.
 
 - `JobStatus` - `queued`, `parsing`, `estimating`, `translating`, `building`, `completed`, `failed`;
 - `TranslationJob`;
+- `file_type` - `docx` или `pdf`;
 - progress validation `0..100`;
 - `created_at` и `updated_at`;
 - `upload_path`;
 - `result_file`;
 - `error`.
 
-## DOCX services
+## Translation services
 
 ### `app/services/translator.py`
 
-Главный orchestration-сервис DOCX pipeline.
+Главный orchestration-сервис общего DOCX/PDF pipeline.
 
-Выполняет:
+Для DOCX используется `translate_docx_file`.
 
-1. Парсинг DOCX в `DocumentBlock`.
+Для PDF используется `translate_pdf_file`.
+
+Общая часть выполняет:
+
+1. Парсинг документа в `DocumentBlock`.
 2. In-memory дедупликацию повторяющихся блоков внутри документа.
 3. Поиск переводов в Redis cache.
 4. Поиск переводов в SQLite translation memory.
@@ -378,7 +421,7 @@ Pydantic-схемы API и переводимых блоков.
 8. Передачу релевантных glossary terms в batch.
 9. Сохранение новых переводов в in-memory cache, Redis cache и translation memory.
 10. Применение переводов к дубликатам.
-11. Сборку итогового DOCX.
+11. Сборку итогового DOCX или PDF.
 12. Отправку progress callback для worker-а и SSE.
 
 Разделяет ошибки на:
@@ -399,6 +442,62 @@ Pydantic-схемы API и переводимых блоков.
 - пропуск пустых блоков;
 - пометку технического и code-like текста как непереводимого.
 
+### `app/services/builder.py`
+
+Сборка итогового DOCX.
+
+Отвечает за:
+
+- открытие исходного DOCX;
+- замену текста в обычных абзацах;
+- замену текста в таблицах;
+- сохранение результата в `outputs/`;
+- сохранение базовой структуры документа.
+
+### `app/services/run_preserver.py`
+
+Замена текста с сохранением run-структуры.
+
+Используется DOCX builder-ом, чтобы:
+
+- не удалять существующие runs;
+- сохранять форматирование вроде bold/italic;
+- сохранять hyperlink container;
+- распределять перевод по исходным runs пропорционально длине;
+- корректно обрабатывать пробелы через `xml:space="preserve"`.
+
+### `app/services/pdf/parser.py`
+
+Парсер PDF.
+
+Отвечает за:
+
+- чтение PDF через PyMuPDF;
+- извлечение text-based содержимого;
+- нормализацию пробелов;
+- пропуск пустых страниц и пустых блоков;
+- формирование `DocumentBlock`;
+- заполнение metadata вроде `page` и `source="pdf"`.
+
+Текущий parser работает с текстовым слоем PDF. OCR для сканов не реализован.
+
+### `app/services/pdf/builder.py`
+
+Сборка итогового PDF.
+
+Текущая реализация создает новый PDF из переведенных `DocumentBlock`.
+
+Она:
+
+- пишет переведенный текст в новый PDF;
+- добавляет страницы при переполнении;
+- сохраняет результат в `outputs/`;
+- не переносит изображения;
+- не сохраняет исходный layout;
+- не восстанавливает таблицы как структуры.
+
+Для точного PDF->PDF нужен отдельный layout-aware builder поверх исходного PDF.
+
 ### `app/services/segmenter.py`
 
 Сегментация переводимых блоков.
@@ -413,7 +512,7 @@ Pydantic-схемы API и переводимых блоков.
 
 ### `app/services/translation_cache.py`
 
-In-memory кэш внутри одного DOCX-прохода.
+In-memory кэш внутри одного прохода документа.
 
 Используется для:
 
@@ -456,41 +555,22 @@ SQLite translation memory и glossary.
 - итоговую стоимость с округлением;
 - статус бюджета `ok` или `exceeded`.
 
-### `app/services/builder.py`
-
-Сборка итогового DOCX.
-
-Отвечает за:
-
-- открытие исходного DOCX;
-- замену текста в обычных абзацах;
-- замену текста в таблицах;
-- сохранение результата в `outputs/`;
-- сохранение базовой структуры документа.
-
-### `app/services/run_preserver.py`
-
-Замена текста с сохранением run-структуры.
-
-Используется builder-ом, чтобы:
-
-- не удалять существующие runs;
-- сохранять форматирование вроде bold/italic;
-- сохранять hyperlink container;
-- распределять перевод по исходным runs пропорционально длине;
-- корректно обрабатывать пробелы через `xml:space="preserve"`.
-
 ## Worker
 
 ### `workers/translation_worker.py`
 
 Celery worker для фонового перевода.
 
+Содержит задачи:
+
+- `run_translation_job` - DOCX;
+- `run_pdf_translation_job` - PDF.
+
 Отвечает за:
 
 - получение `job_id`;
 - загрузку job из Redis job store;
-- запуск `translate_docx_file`;
+- запуск `translate_docx_file` или `translate_pdf_file`;
 - обновление job state;
 - публикацию progress events;
 - retry provider errors;
@@ -506,12 +586,6 @@ Worker должен запускаться отдельно от FastAPI.
 
 Создает `QApplication`, открывает `MainWindow` и запускает Qt event loop.
 
-Запуск:
-
-```powershell
-py -m desktop_ui.main
-```
-
 ### `desktop_ui/config.py`
 
 Настройки desktop UI.
@@ -525,12 +599,7 @@ py -m desktop_ui.main
 
 По умолчанию `API_BASE_URL = http://localhost:8000`.
 
-Если на `8000` запущено другое приложение, UI нужно запускать так:
-
-```powershell
-$env:DESKTOP_API_BASE_URL = "http://127.0.0.1:8010"
-py -m desktop_ui.main
-```
+Если backend запущен на другом порту, UI нужно запускать с `DESKTOP_API_BASE_URL`.
 
 ### `desktop_ui/core/api_client.py`
 
@@ -539,15 +608,17 @@ HTTP-клиент UI.
 Методы:
 
 - `estimate(file_path, source, target)` -> `POST /estimate/`;
-- `upload(file_path, source, target)` -> `POST /translate/`;
+- `upload(file_path, source, target)` -> `POST /translate/` для DOCX или `POST /translate/pdf` для PDF;
 - `get_status(job_id)` -> `GET /status/{job_id}`;
 - `download(job_id, save_path, result_file)` -> `GET /download/{job_id}`.
 
 Отвечает за:
 
+- выбор endpoint по расширению файла;
 - multipart upload;
 - multipart estimate request;
-- сохранение скачанного DOCX в выбранный путь;
+- передачу `file_type` для estimate;
+- сохранение скачанного DOCX/PDF в выбранный путь;
 - короткие пользовательские ошибки;
 - fallback-сообщение с `result_file`, если backend без `/download/{job_id}` вернул `404 Not Found`.
 
@@ -577,7 +648,7 @@ Signals:
 
 UI элементы:
 
-- `Select DOCX`;
+- выбор DOCX/PDF;
 - label выбранного пути;
 - source language dropdown;
 - target language dropdown;
@@ -591,25 +662,27 @@ UI элементы:
 
 Поведение:
 
-- принимает только `.docx`;
+- принимает `.docx` и `.pdf`;
 - запрещает одинаковые языки;
 - позволяет предварительно оценить стоимость перевода;
 - показывает characters, tokens, estimated cost, budget и статус бюджета;
 - при превышении бюджета просит подтверждение перед запуском перевода;
 - отключает input во время estimate/upload;
 - запускает polling после успешного upload;
-- отображает все backend-статусы, включая `estimating`;
+- отображает backend-статусы, включая `estimating`;
 - включает download только при `completed`;
-- предлагает имя результата вида `source_translated_to_ru.docx`;
+- предлагает имя результата вида `source_translated_to_ru.docx` или `source_translated_to_ru.pdf`;
 - не закрывает окно во время активного estimate/upload/download;
 - останавливает polling при закрытии окна.
 
-## Основной async flow
+## Основные flows
+
+### DOCX async flow
 
 ```text
 Desktop UI
         |
-        | POST /estimate/ (optional preflight)
+        | POST /estimate/ (optional preflight, file_type=docx)
         v
 FastAPI validates DOCX + estimates chars/tokens/cost/budget
         |
@@ -624,7 +697,7 @@ FastAPI validates DOCX + languages + size
 uploads/<source>.docx
         |
         v
-TranslationJob(status=queued, progress=0)
+TranslationJob(file_type=docx, status=queued, progress=0)
         |
         v
 RedisJobStore
@@ -654,64 +727,69 @@ Desktop UI polls GET /status/{job_id}
 Desktop UI downloads GET /download/{job_id}
 ```
 
-## DOCX pipeline
+### PDF async flow
 
 ```text
-DOCX source file
+Desktop UI
+        |
+        | POST /estimate/ (optional preflight, file_type=pdf)
+        v
+FastAPI validates PDF + estimates chars/tokens/cost/budget
         |
         v
-extract_docx_blocks()
+Desktop UI shows estimate and may ask confirmation if budget exceeded
+        |
+        | POST /translate/pdf
+        v
+FastAPI validates PDF + languages + size
         |
         v
-DocumentBlock[]
+uploads/<source>.pdf
         |
         v
-Фильтрация пустых, технических и code-like блоков
+TranslationJob(file_type=pdf, status=queued, progress=0)
         |
         v
-In-memory deduplication внутри документа
+RedisJobStore
         |
         v
-Redis cache lookup
+Celery task: workers.translation_worker.run_pdf_translation_job
         |
         v
-SQLite translation memory lookup
+Worker loads job
         |
         v
-Cost estimate для оставшихся блоков
+translate_pdf_file(...)
         |
         v
-Batch segmentation
+extract_pdf_blocks() -> translate_document_blocks() -> build_pdf()
         |
         v
-OpenAI-compatible client / Mock client
+outputs/*_translated_to_{target}.pdf
         |
         v
-Redis cache + SQLite memory save
+RedisJobStore(result_file, status=completed, progress=100)
         |
         v
-Применение переводов к дубликатам
+Desktop UI polls GET /status/{job_id}
         |
         v
-build_translated_docx()
-        |
-        v
-outputs/*_translated_to_{lang}.docx
+Desktop UI downloads GET /download/{job_id}
 ```
 
 ## Рабочие директории
 
 ### `uploads/`
 
-Хранит загруженные исходные DOCX-файлы.
+Хранит загруженные исходные DOCX/PDF-файлы.
 
 ### `outputs/`
 
-Хранит готовые переведенные DOCX-файлы.
+Хранит готовые переведенные DOCX/PDF-файлы.
 
 ### `tmp/`
 
-Используется для временных файлов и локальных проверок.
+Используется для временных файлов estimate flow и локальных проверок.
 
 ### `data/`
 
@@ -727,7 +805,15 @@ outputs/*_translated_to_{lang}.docx
 $env:MOCK_AI_ENABLED = "true"
 ```
 
+Или в `.env`:
+
+```text
+MOCK_AI_ENABLED=true
+```
+
 В этом режиме реальные AI-запросы не выполняются. `MockAIClient` возвращает текст в формате `source text [target_lang]`.
+
+Важно: mock-результаты могут попасть в Redis translation cache и SQLite translation memory. Перед реальной проверкой нужно выключить mock-режим и очистить stale-кэш переводов, если он уже был создан.
 
 ### Реальный AI-режим
 
@@ -737,11 +823,19 @@ $env:MOCK_AI_ENABLED = "true"
 $env:MOCK_AI_ENABLED = "false"
 ```
 
+Или в `.env`:
+
+```text
+MOCK_AI_ENABLED=false
+```
+
 Нужны:
 
 - `OPENAI_API_KEY`;
 - `OPENAI_MODEL`;
 - опционально `OPENAI_BASE_URL`.
+
+После изменения `.env` нужно перезапустить backend и worker, потому что настройки читаются при старте процессов.
 
 ## Endpoint-ы
 
@@ -750,6 +844,7 @@ $env:MOCK_AI_ENABLED = "false"
 - `GET /health`;
 - `POST /estimate/`;
 - `POST /translate/`;
+- `POST /translate/pdf`;
 - `POST /translate/sync`;
 - `GET /status/{job_id}`;
 - `GET /stream/{job_id}`;
@@ -762,7 +857,9 @@ $env:MOCK_AI_ENABLED = "false"
 - история переводов;
 - пользовательское управление glossary через API;
 - авторизация;
-- production installer для desktop UI.
+- production installer для desktop UI;
+- OCR для PDF;
+- точное сохранение исходного PDF layout.
 
 ## Локальный запуск
 
@@ -772,15 +869,9 @@ $env:MOCK_AI_ENABLED = "false"
 py -m pip install -r requirements.txt
 ```
 
-### Установка desktop UI-зависимостей
+### Redis/Memurai
 
-```powershell
-py -m pip install -r .\desktop_ui\requirements.txt
-```
-
-### Redis
-
-Redis обязателен для async jobs, Celery, job state и progress events.
+Redis обязателен для async jobs, Celery, job state, progress events и translation cache.
 
 Проверка:
 
@@ -788,11 +879,10 @@ Redis обязателен для async jobs, Celery, job state и progress even
 Test-NetConnection -ComputerName 127.0.0.1 -Port 6379
 ```
 
-Если Redis не установлен, его нужно установить или запустить через доступный runtime. На Windows один из вариантов:
+На Windows в текущем окружении используется Memurai:
 
 ```powershell
-choco install redis-64 -y
-redis-server
+& "C:\Program Files\Memurai\memurai.exe"
 ```
 
 Если используется Docker:
@@ -812,13 +902,13 @@ py -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 Если `8000` занят другим приложением:
 
 ```powershell
-py -m uvicorn app.main:app --host 127.0.0.1 --port 8010
+py -m uvicorn app.main:app --host 127.0.0.1 --port 8001
 ```
 
 Проверка:
 
 ```powershell
-Invoke-RestMethod -Uri "http://127.0.0.1:8010/health"
+Invoke-RestMethod -Uri "http://127.0.0.1:8001/health"
 ```
 
 ### Celery worker
@@ -826,14 +916,10 @@ Invoke-RestMethod -Uri "http://127.0.0.1:8010/health"
 На Windows предпочтительно запускать через Python-модуль:
 
 ```powershell
-py -m celery -A app.core.celery_app worker --pool=solo --loglevel=info
+py -m celery -A app.core.celery_app.celery_app worker --pool=solo --loglevel=info
 ```
 
-Если executable `celery` есть в `PATH`, можно так:
-
-```powershell
-celery -A app.core.celery_app worker --pool=solo --loglevel=info
-```
+Worker готов, когда в логе появляется строка `ready`.
 
 ### Desktop UI
 
@@ -843,10 +929,10 @@ celery -A app.core.celery_app worker --pool=solo --loglevel=info
 py -m desktop_ui.main
 ```
 
-Если backend на `8010`:
+Если backend на `8001`:
 
 ```powershell
-$env:DESKTOP_API_BASE_URL = "http://127.0.0.1:8010"
+$env:DESKTOP_API_BASE_URL = "http://127.0.0.1:8001"
 py -m desktop_ui.main
 ```
 
@@ -856,34 +942,36 @@ py -m desktop_ui.main
 
 Основные группы:
 
-- `tests/test_services.py` - backend, DOCX services, worker, endpoints, SSE, download, estimate endpoint, price estimator;
-- `tests/test_desktop_api_client.py` - desktop `ApiClient.estimate()` без запуска Qt.
+- `tests/test_services.py` - backend, DOCX/PDF services, worker, endpoints, SSE, download, estimate endpoint, price estimator;
+- `tests/test_desktop_api_client.py` - desktop `ApiClient` без запуска Qt.
 
 Покрывается:
 
-- парсинг абзацев и таблиц;
-- сохранение run-форматирования;
+- парсинг DOCX абзацев и таблиц;
+- парсинг PDF в `DocumentBlock`;
+- сборка PDF;
+- сохранение DOCX run-форматирования;
 - сохранение list style;
-- сохранение структуры таблиц;
+- сохранение структуры таблиц DOCX;
 - сохранение hyperlink container;
 - in-memory translation cache;
 - Redis translation cache;
 - segmenter limits;
 - cost estimator;
 - price estimator;
-- estimate endpoint;
-- валидация upload endpoint;
-- mock DOCX-проход;
+- estimate endpoint для DOCX и PDF;
+- валидация DOCX/PDF upload endpoint;
+- mock DOCX/PDF проход;
 - Redis cache hit/save;
 - translation memory hit/save;
 - glossary terms per batch;
-- создание queued job;
+- создание queued job для DOCX/PDF;
 - status endpoint;
-- download endpoint;
+- download endpoint для DOCX/PDF;
 - SSE stream endpoint;
 - worker success/failure flow;
-- desktop API error mapping;
-- desktop estimate API flow.
+- desktop API endpoint selection для DOCX/PDF;
+- desktop API error mapping.
 
 Запуск:
 
@@ -891,22 +979,53 @@ py -m desktop_ui.main
 py -m pytest
 ```
 
-В исходниках сейчас 40 test-функций. Актуальный результат проверки нужно обновлять после запуска `py -m pytest`.
+Актуальный проверенный набор:
+
+```powershell
+python -m pytest tests/test_services.py tests/test_desktop_api_client.py
+```
+
+Результат последней проверки: `53 passed, 1 warning`.
 
 ## Текущий статус архитектуры
 
 Приложение больше не является backend-only MVP:
 
 - есть отдельный PySide6 desktop UI;
+- поддерживаются DOCX и text-based PDF;
 - есть предварительная оценка стоимости через `/estimate/`;
 - основной перевод выполняется через async jobs;
 - состояние job хранится в Redis;
 - progress доступен через status endpoint и SSE;
-- результат скачивается через `/download/{job_id}`;
+- результат скачивается через общий `/download/{job_id}`;
 - worker отделен от API-процесса;
 - Redis cache переиспользует переводы между worker-ами;
 - SQLite translation memory хранит накопленные переводы и glossary;
 - DOCX builder сохраняет run-level форматирование;
+- PDF builder создает новый PDF из переведенного текста;
 - full desktop flow зависит от корректного запуска Redis, FastAPI, Celery worker и UI.
 
-Следующие крупные расширения лучше добавлять после стабилизации одиночного DOCX flow: batch upload, история переводов, glossary UI/API, авторизация и installer.
+## Текущие ограничения PDF
+
+PDF поддержка в текущем виде является text-based MVP.
+
+Ограничения:
+
+- OCR не поддерживается;
+- отсканированные PDF без text layer не переводятся;
+- исходные изображения не переносятся в результат;
+- исходный PDF layout не сохраняется;
+- таблицы PDF не восстанавливаются как структуры;
+- PDF builder создает новый PDF, а не редактирует исходный;
+- перевод может отличаться по длине от исходного текста, поэтому точное позиционирование пока отсутствует.
+
+Для точного PDF->PDF нужен layout-aware подход:
+
+- parser должен извлекать текстовые блоки с `page`, `bbox`, `font_size`, цветом и другими layout-данными;
+- builder должен открывать исходный PDF как основу;
+- исходный текст нужно скрывать или удалять в пределах bbox;
+- переведенный текст нужно вставлять в те же координаты;
+- изображения, фон и векторная графика должны оставаться из исходного PDF;
+- нужен fit-to-box алгоритм для длинного перевода.
+
+Следующие крупные расширения лучше добавлять после стабилизации одиночного DOCX/PDF flow: layout-aware PDF builder, OCR, batch upload, история переводов, glossary UI/API, авторизация и installer.

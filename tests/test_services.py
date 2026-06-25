@@ -1,8 +1,10 @@
 import asyncio
 import zipfile
 from types import SimpleNamespace
+from typing import Literal
 
 import pytest
+import fitz
 from docx import Document
 from docx.opc.constants import RELATIONSHIP_TYPE
 from docx.oxml import OxmlElement
@@ -14,7 +16,7 @@ from redis.exceptions import RedisError
 from app.api.download import get_translation_download
 from app.api.estimate import estimate_docx
 from app.api.status import get_translation_status
-from app.api.translate import translate_docx
+from app.api.translate import translate_docx, translate_pdf
 from app.core.cache import RedisTranslationCache, build_cache_key
 from app.core.config import Settings
 from app.core.job_store import InMemoryJobStore
@@ -25,6 +27,9 @@ from app.models.schemas import DocumentBlock, LanguageCode
 from app.services.builder import build_translated_docx
 from app.services.cost_estimator import estimate_translation_cost
 from app.services.docx_parser import extract_docx_blocks
+from app.services.pdf.builder import build_pdf
+from app.services.pdf.layout_parser import PDFTextBlock, extract_pdf_layout_blocks
+from app.services.pdf.parser import extract_pdf_blocks
 from app.services.price_estimator import (
     budget_status,
     estimate_output_tokens,
@@ -34,7 +39,7 @@ from app.services.segmenter import build_translation_batches
 from app.services.translator import DocumentProcessingError, translate_docx_file
 from app.services.translation_cache import TranslationCache, normalize_translation_cache_text
 from app.services.translation_memory import SQLiteTranslationMemory
-from workers.translation_worker import process_translation_job
+from workers.translation_worker import process_pdf_translation_job, process_translation_job
 
 
 def test_extract_docx_blocks_from_paragraphs_and_tables(tmp_path):
@@ -53,6 +58,125 @@ def test_extract_docx_blocks_from_paragraphs_and_tables(tmp_path):
     assert blocks[0].text == "Document title"
     assert blocks[1].translatable is False
     assert blocks[2].location == "table:1:row:1:cell:1:paragraph:1"
+
+
+def test_extract_pdf_blocks_normalizes_text_and_skips_empty_pages(tmp_path):
+    source_path = tmp_path / "source.pdf"
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_text((72, 72), "Hello   world\n\nSecond line")
+    document.new_page()
+    document.save(source_path)
+    document.close()
+
+    blocks = extract_pdf_blocks(source_path)
+
+    assert len(blocks) == 2
+    assert all(isinstance(block, DocumentBlock) for block in blocks)
+    assert blocks[0].block_id == "p1b1"
+    assert blocks[0].text == "Hello world"
+    assert blocks[0].location == "page:1:block:1"
+    assert blocks[0].metadata == {"page": 1, "source": "pdf"}
+    assert blocks[1].block_id == "p1b2"
+    assert blocks[1].text == "Second line"
+    assert blocks[1].metadata == {"page": 1, "source": "pdf"}
+
+
+def test_extract_pdf_layout_blocks_uses_line_level_metadata(tmp_path):
+    source_path = tmp_path / "layout.pdf"
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_text((72, 72), "Hello   layout", fontsize=13)
+    page.insert_text((72, 96), "Second line", fontsize=9)
+    document.save(source_path)
+    document.close()
+
+    blocks = extract_pdf_layout_blocks(source_path)
+
+    assert len(blocks) == 2
+    assert all(isinstance(block, PDFTextBlock) for block in blocks)
+    assert [block.block_id for block in blocks] == ["p0l1", "p0l2"]
+    assert [block.text for block in blocks] == ["Hello layout", "Second line"]
+    assert [block.page for block in blocks] == [0, 0]
+    assert all(len(block.bbox) == 4 for block in blocks)
+    assert blocks[0].font_size == pytest.approx(13)
+    assert blocks[0].font_name is not None
+    assert blocks[0].translatable is True
+
+
+def test_extract_pdf_layout_blocks_marks_technical_lines_non_translatable(tmp_path):
+    source_path = tmp_path / "layout-technical.pdf"
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_text(
+        (72, 72),
+        "Body text\nWPS-001\nhttps://example.com\nPage 1\n12345678\nEN ISO 15614-1",
+    )
+    document.save(source_path)
+    document.close()
+
+    blocks = extract_pdf_layout_blocks(source_path)
+
+    assert [block.text for block in blocks] == [
+        "Body text",
+        "WPS-001",
+        "https://example.com",
+        "Page 1",
+        "12345678",
+        "EN ISO 15614-1",
+    ]
+    assert [block.translatable for block in blocks] == [
+        True,
+        False,
+        False,
+        False,
+        False,
+        False,
+    ]
+
+
+def test_build_pdf_writes_blocks_to_output_pdf(tmp_path):
+    output_path = tmp_path / "outputs" / "translated.pdf"
+
+    build_pdf(
+        [
+            _block("p1b1", "Translated title"),
+            _block("p1b2", "Translated body text"),
+            _block("p1b3", "   "),
+        ],
+        output_path.as_posix(),
+    )
+
+    assert output_path.is_file()
+
+    document = fitz.open(output_path)
+    try:
+        text = "\n".join(page.get_text() for page in document)
+    finally:
+        document.close()
+
+    assert "Translated title" in text
+    assert "Translated body text" in text
+
+
+def test_build_pdf_adds_pages_when_content_exceeds_page_height(tmp_path):
+    output_path = tmp_path / "outputs" / "translated.pdf"
+    blocks = [
+        _block(f"p1b{index}", f"Translated paragraph {index}")
+        for index in range(1, 80)
+    ]
+
+    build_pdf(blocks, output_path.as_posix())
+
+    document = fitz.open(output_path)
+    try:
+        assert document.page_count > 1
+        text = "\n".join(page.get_text() for page in document)
+    finally:
+        document.close()
+
+    assert "Translated paragraph 1" in text
+    assert "Translated paragraph 79" in text
 
 
 def test_build_translated_docx_replaces_paragraphs_and_table_cells(tmp_path):
@@ -299,6 +423,69 @@ def test_estimate_endpoint_accepts_docx_and_does_not_enqueue_job(tmp_path, monke
     assert response.translatable_blocks == 1
     assert response.skipped_blocks == 1
     assert response.estimated_characters == 11
+    assert response.estimated_input_tokens == 3
+    assert response.estimated_output_tokens == 4
+    assert response.estimated_total_tokens == 7
+    assert response.estimated_cost_usd > 0
+    assert response.budget_status == "ok"
+
+
+def test_estimate_endpoint_accepts_pdf_and_uses_pdf_parser(tmp_path, monkeypatch):
+    pdf_path = tmp_path / "estimate.pdf"
+    document = fitz.open()
+    document.new_page().insert_text((72, 72), "Hello PDF")
+    document.save(pdf_path)
+    document.close()
+    file = _UploadFileStub(
+        filename="estimate.pdf",
+        content_type="application/pdf",
+        content=pdf_path.read_bytes(),
+    )
+
+    monkeypatch.setattr(
+        "app.api.estimate.get_settings",
+        lambda: Settings(
+            tmp_dir=tmp_path / "tmp",
+            translation_budget_usd=10,
+            estimated_output_token_multiplier=1.2,
+            translation_memory_db_path=tmp_path / "memory.sqlite3",
+        ),
+    )
+    monkeypatch.setattr(
+        "app.api.estimate.extract_docx_blocks",
+        lambda path: pytest.fail("PDF estimate should not use DOCX parser"),
+    )
+    monkeypatch.setattr(
+        "app.api.estimate.extract_pdf_blocks",
+        lambda path: [
+            _block("p1b1", "Hello PDF"),
+            _block("p1b2", "SKIP123", translatable=False),
+        ],
+    )
+    monkeypatch.setattr(
+        "app.api.estimate.get_job_store",
+        lambda: pytest.fail("estimate should not create jobs"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "app.api.estimate._enqueue_translation_job",
+        lambda job_id: pytest.fail("estimate should not enqueue Celery tasks"),
+        raising=False,
+    )
+
+    response = asyncio.run(
+        estimate_docx(
+            file=file,
+            source_lang=LanguageCode.EN,
+            target_lang=LanguageCode.RU,
+            file_type="pdf",
+        )
+    )
+
+    assert response.file_name == "estimate.pdf"
+    assert response.translatable_blocks == 1
+    assert response.skipped_blocks == 1
+    assert response.estimated_characters == 9
     assert response.estimated_input_tokens == 3
     assert response.estimated_output_tokens == 4
     assert response.estimated_total_tokens == 7
@@ -653,9 +840,126 @@ def test_translate_endpoint_creates_queued_job_without_ai_call(tmp_path, monkeyp
     assert stored_job is not None
     assert stored_job.status == JobStatus.QUEUED
     assert stored_job.progress == 0
+    assert stored_job.file_type == "docx"
     assert stored_job.original_filename == "queued.docx"
     assert stored_job.upload_path.startswith(upload_dir.as_posix())
     assert enqueued_job_ids == [response.job_id]
+
+
+def test_translate_pdf_endpoint_creates_separate_queued_pdf_job(tmp_path, monkeypatch):
+    store = InMemoryJobStore()
+    enqueued_job_ids: list[str] = []
+    upload_dir = tmp_path / "uploads"
+    pdf_path = tmp_path / "queued.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n%test\n")
+    file = _UploadFileStub(
+        filename="queued.pdf",
+        content_type="application/pdf",
+        content=pdf_path.read_bytes(),
+    )
+
+    monkeypatch.setattr(
+        "app.api.translate.get_settings",
+        lambda: Settings(
+            mock_ai_enabled=True,
+            upload_dir=upload_dir,
+            output_dir=tmp_path / "outputs",
+            tmp_dir=tmp_path / "tmp",
+            translation_memory_db_path=tmp_path / "memory.sqlite3",
+        ),
+    )
+    monkeypatch.setattr("app.api.translate.get_job_store", lambda: store)
+    monkeypatch.setattr(
+        "app.api.translate._enqueue_pdf_translation_job",
+        lambda job_id: enqueued_job_ids.append(job_id),
+    )
+
+    response = asyncio.run(
+        translate_pdf(
+            file=file,
+            source_lang=LanguageCode.EN,
+            target_lang=LanguageCode.RU,
+        )
+    )
+
+    stored_job = store.get_job(response.job_id)
+    assert response.status == JobStatus.QUEUED
+    assert response.file_type == "pdf"
+    assert stored_job is not None
+    assert stored_job.status == JobStatus.QUEUED
+    assert stored_job.progress == 0
+    assert stored_job.file_type == "pdf"
+    assert stored_job.original_filename == "queued.pdf"
+    assert stored_job.upload_path.startswith(upload_dir.as_posix())
+    assert enqueued_job_ids == [response.job_id]
+
+
+def test_translate_pdf_endpoint_rejects_non_pdf_file():
+    file = SimpleNamespace(filename="document.docx", content_type="application/pdf")
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            translate_pdf(
+                file=file,
+                source_lang=LanguageCode.EN,
+                target_lang=LanguageCode.RU,
+            )
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "only PDF files are supported"
+
+
+def test_translate_pdf_endpoint_rejects_invalid_pdf_content_type():
+    file = SimpleNamespace(filename="document.pdf", content_type="text/plain")
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            translate_pdf(
+                file=file,
+                source_lang=LanguageCode.EN,
+                target_lang=LanguageCode.RU,
+            )
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "invalid PDF content type"
+
+
+def test_job_store_preserves_pdf_file_type():
+    store = InMemoryJobStore()
+    job = TranslationJob(
+        job_id="job-pdf",
+        source_lang=LanguageCode.EN,
+        target_lang=LanguageCode.RU,
+        original_filename="source.pdf",
+        upload_path="uploads/source.pdf",
+        file_type="pdf",
+    )
+
+    store.create_job(job)
+    stored_job = store.get_job("job-pdf")
+
+    assert stored_job is not None
+    assert stored_job.file_type == "pdf"
+
+
+def test_job_store_preserves_pdf_layout_file_type():
+    store = InMemoryJobStore()
+    job = TranslationJob(
+        job_id="job-pdf-layout",
+        source_lang=LanguageCode.EN,
+        target_lang=LanguageCode.RU,
+        original_filename="source.pdf",
+        upload_path="uploads/source.pdf",
+        file_type="pdf_layout",
+    )
+
+    store.create_job(job)
+    stored_job = store.get_job("job-pdf-layout")
+
+    assert stored_job is not None
+    assert stored_job.file_type == "pdf_layout"
 
 
 def test_status_endpoint_returns_job_state(monkeypatch):
@@ -714,6 +1018,28 @@ def test_download_endpoint_returns_completed_result(tmp_path, monkeypatch):
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     )
     assert response.filename == "translated.docx"
+
+
+def test_download_endpoint_returns_pdf_result(tmp_path, monkeypatch):
+    store = InMemoryJobStore()
+    result_path = tmp_path / "translated.pdf"
+    result_path.write_bytes(b"%PDF-1.4\n")
+    store.create_job(
+        _job(
+            "job-download-pdf",
+            status=JobStatus.COMPLETED,
+            progress=100,
+            result_file=result_path.as_posix(),
+            file_type="pdf",
+        )
+    )
+    monkeypatch.setattr("app.api.download.get_job_store", lambda: store)
+
+    response = get_translation_download("job-download-pdf")
+
+    assert response.path == result_path
+    assert response.media_type == "application/pdf"
+    assert response.filename == "translated.pdf"
 
 
 def test_download_endpoint_returns_404_for_missing_job(monkeypatch):
@@ -898,6 +1224,54 @@ def test_worker_processes_translation_job_with_mock_ai(tmp_path, monkeypatch):
     assert translated_document.paragraphs[0].text == "Hello [ru]"
 
 
+def test_worker_processes_pdf_translation_job_with_mock_ai(tmp_path, monkeypatch):
+    store = InMemoryJobStore()
+    source_path = tmp_path / "worker.pdf"
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_text((72, 72), "Hello PDF")
+    document.save(source_path)
+    document.close()
+    job = TranslationJob(
+        job_id="job-pdf-worker",
+        source_lang=LanguageCode.EN,
+        target_lang=LanguageCode.RU,
+        original_filename="worker.pdf",
+        upload_path=source_path.as_posix(),
+        file_type="pdf",
+    )
+    store.create_job(job)
+
+    monkeypatch.setattr("workers.translation_worker.get_job_store", lambda: store)
+    monkeypatch.setattr(
+        "workers.translation_worker.get_settings",
+        lambda: Settings(
+            mock_ai_enabled=True,
+            upload_dir=tmp_path / "uploads",
+            output_dir=tmp_path / "outputs",
+            tmp_dir=tmp_path / "tmp",
+            translation_memory_db_path=tmp_path / "memory.sqlite3",
+        ),
+    )
+
+    process_pdf_translation_job("job-pdf-worker")
+
+    completed_job = store.get_job("job-pdf-worker")
+    assert completed_job is not None
+    assert completed_job.status == JobStatus.COMPLETED
+    assert completed_job.progress == 100
+    assert completed_job.result_file is not None
+    assert completed_job.result_file.endswith(".pdf")
+
+    translated_pdf = fitz.open(completed_job.result_file)
+    try:
+        text = "\n".join(page.get_text() for page in translated_pdf)
+    finally:
+        translated_pdf.close()
+
+    assert "Hello PDF [ru]" in text
+
+
 def test_worker_failed_job_stores_safe_error(tmp_path, monkeypatch):
     store = InMemoryJobStore()
     job = TranslationJob(
@@ -947,6 +1321,7 @@ def _job(
     progress: int = 0,
     error: str | None = None,
     result_file: str | None = None,
+    file_type: Literal["docx", "pdf", "pdf_layout"] = "docx",
 ) -> TranslationJob:
     return TranslationJob(
         job_id=job_id,
@@ -956,6 +1331,7 @@ def _job(
         target_lang=LanguageCode.RU,
         original_filename="source.docx",
         upload_path="uploads/source.docx",
+        file_type=file_type,
         result_file=result_file,
         error=error,
     )

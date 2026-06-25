@@ -24,7 +24,12 @@ class ApiClient:
         if not path.is_file():
             raise ApiClientError("File does not exist")
 
-        url = f"{self.base_url}/translate/"
+        file_type = self._file_type(path)
+        url = (
+            f"{self.base_url}/translate/pdf"
+            if file_type == "pdf"
+            else f"{self.base_url}/translate/"
+        )
         try:
             with path.open("rb") as file_handle:
                 response = requests.post(
@@ -33,7 +38,7 @@ class ApiClient:
                         "file": (
                             path.name,
                             file_handle,
-                            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                            self._content_type(file_type),
                         )
                     },
                     data={
@@ -52,6 +57,7 @@ class ApiClient:
         if not path.is_file():
             raise ApiClientError("File does not exist")
 
+        file_type = self._file_type(path)
         url = f"{self.base_url}/estimate/"
         try:
             with path.open("rb") as file_handle:
@@ -61,12 +67,13 @@ class ApiClient:
                         "file": (
                             path.name,
                             file_handle,
-                            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                            self._content_type(file_type),
                         )
                     },
                     data={
                         "source_lang": source,
                         "target_lang": target,
+                        "file_type": file_type,
                     },
                     timeout=self.timeout,
                 )
@@ -126,6 +133,19 @@ class ApiClient:
             return "Request timed out"
         return "Backend is unavailable"
 
+    def _file_type(self, path: Path) -> str:
+        suffix = path.suffix.lower()
+        if suffix == ".pdf":
+            return "pdf"
+        if suffix == ".docx":
+            return "docx"
+        raise ApiClientError("Only DOCX and PDF files are supported")
+
+    def _content_type(self, file_type: str) -> str:
+        if file_type == "pdf":
+            return "application/pdf"
+        return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
     def _error_message(self, response: requests.Response, fallback: str) -> str:
         try:
             payload = response.json()
@@ -168,7 +188,9 @@ class ApiClient:
     def _friendly_detail(self, detail: str, status_code: int) -> str:
         known_details = {
             "invalid DOCX content type": "Only DOCX files are supported",
+            "invalid PDF content type": "Only PDF files are supported",
             "only DOCX files are supported": "Only DOCX files are supported",
+            "only PDF files are supported": "Only PDF files are supported",
             "source_lang and target_lang must be different": (
                 "Source and target languages must be different"
             ),
@@ -179,6 +201,7 @@ class ApiClient:
             "failed to process DOCX file": "Translation failed",
             "translation queue is unavailable": "Backend queue is unavailable",
             "file is too large": "File is too large",
+            "failed to process PDF file": "Translation failed",
         }
         if detail in known_details:
             return known_details[detail]

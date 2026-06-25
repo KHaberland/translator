@@ -1,5 +1,6 @@
 from datetime import UTC, datetime
 from enum import StrEnum
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -24,6 +25,7 @@ class TranslationJob(BaseModel):
     target_lang: LanguageCode
     original_filename: str
     upload_path: str
+    file_type: Literal["docx", "pdf", "pdf_layout"] = "docx"
     result_file: str | None = None
     error: str | None = None
     created_at: str = Field(default_factory=lambda: _now_iso())

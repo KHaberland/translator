@@ -7,7 +7,12 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
 from app.core.config import get_settings
 from app.core.job_store import get_job_store
 from app.models.jobs import TranslationJob
-from app.models.schemas import LanguageCode, TranslateJobResponse, TranslateResponse
+from app.models.schemas import (
+    LanguageCode,
+    PdfTranslateJobResponse,
+    TranslateJobResponse,
+    TranslateResponse,
+)
 from app.services.translator import (
     DocumentProcessingError,
     TranslationProviderError,
@@ -20,6 +25,7 @@ DOCX_CONTENT_TYPES = {
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     "application/octet-stream",
 }
+PDF_CONTENT_TYPE = "application/pdf"
 
 
 @router.post("/", response_model=TranslateJobResponse)
@@ -65,6 +71,56 @@ async def translate_docx(
 
     logger.info("translation status=queued job_id=%s file=%s", job_id, upload_path.name)
     return TranslateJobResponse(job_id=job_id, status=job.status)
+
+
+@router.post("/pdf", response_model=PdfTranslateJobResponse)
+async def translate_pdf(
+    file: UploadFile = File(...),
+    source_lang: LanguageCode = Form(...),
+    target_lang: LanguageCode = Form(...),
+) -> PdfTranslateJobResponse:
+    if source_lang == target_lang:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="source_lang and target_lang must be different",
+        )
+
+    _validate_pdf_file(file)
+
+    settings = get_settings()
+    content = await file.read()
+    upload_path = _save_uploaded_file(
+        content=content,
+        filename=file.filename or "document.pdf",
+        max_file_size_bytes=settings.max_file_size_bytes,
+    )
+
+    job_id = uuid4().hex
+    job = TranslationJob(
+        job_id=job_id,
+        source_lang=source_lang,
+        target_lang=target_lang,
+        original_filename=file.filename or upload_path.name,
+        upload_path=upload_path.as_posix(),
+        file_type="pdf",
+    )
+
+    try:
+        get_job_store().create_job(job)
+        _enqueue_pdf_translation_job(job_id)
+    except Exception as exc:
+        logger.warning("translation status=failed file=%s reason=queue", upload_path.name)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="translation queue is unavailable",
+        ) from exc
+
+    logger.info("translation status=queued job_id=%s file=%s", job_id, upload_path.name)
+    return PdfTranslateJobResponse(
+        job_id=job_id,
+        status=job.status,
+        file_type=job.file_type,
+    )
 
 
 @router.post("/sync", response_model=TranslateResponse)
@@ -135,6 +191,22 @@ def _validate_docx_file(file: UploadFile) -> None:
         )
 
 
+def _validate_pdf_file(file: UploadFile) -> None:
+    filename = file.filename or ""
+    if not filename.lower().endswith(".pdf"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="only PDF files are supported",
+        )
+
+    content_type = getattr(file, "content_type", None)
+    if content_type != PDF_CONTENT_TYPE:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="invalid PDF content type",
+        )
+
+
 def _build_upload_name(filename: str) -> str:
     suffix = Path(filename).suffix.lower() or ".docx"
     stem = Path(filename).stem or "document"
@@ -164,3 +236,9 @@ def _enqueue_translation_job(job_id: str) -> None:
     from workers.translation_worker import run_translation_job
 
     run_translation_job.delay(job_id)
+
+
+def _enqueue_pdf_translation_job(job_id: str) -> None:
+    from workers.translation_worker import run_pdf_translation_job
+
+    run_pdf_translation_job.delay(job_id)

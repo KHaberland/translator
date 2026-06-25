@@ -9,3 +9,5 @@ python-dotenv
 pytest
 redis
 celery
+PyMuPDF
+reportlab

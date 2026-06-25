@@ -1,6 +1,7 @@
 from enum import StrEnum
+from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class LanguageCode(StrEnum):
@@ -26,6 +27,7 @@ class DocumentBlock(BaseModel):
     location: str
     translatable: bool = True
     reason: str | None = None
+    metadata: dict[str, object] = Field(default_factory=dict)
 
 
 class TranslateResponse(BaseModel):
@@ -54,6 +56,14 @@ class EstimateResponse(BaseModel):
 class TranslateJobResponse(BaseModel):
     job_id: str
     status: str
+
+
+class PdfTranslateJobResponse(TranslateJobResponse):
+    file_type: Literal["pdf"]
+
+
+class PdfLayoutTranslateJobResponse(TranslateJobResponse):
+    file_type: Literal["pdf_layout"]
 
 
 class JobStatusResponse(BaseModel):

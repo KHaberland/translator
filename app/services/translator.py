@@ -10,6 +10,8 @@ from app.models.schemas import DocumentBlock, LanguageCode
 from app.services.builder import build_translated_docx
 from app.services.cost_estimator import estimate_translation_cost
 from app.services.docx_parser import extract_docx_blocks
+from app.services.pdf.builder import build_pdf
+from app.services.pdf.parser import extract_pdf_blocks
 from app.services.segmenter import build_translation_batches
 from app.services.translation_cache import TranslationCache
 from app.services.translation_memory import SQLiteTranslationMemory, get_translation_memory
@@ -36,6 +38,14 @@ class TranslationResult:
     estimated_tokens: int
 
 
+@dataclass
+class BlocksTranslationResult:
+    translations: dict[str, str]
+    translated_blocks: list[DocumentBlock]
+    estimated_characters: int
+    estimated_tokens: int
+
+
 async def translate_docx_file(
     source_path: Path,
     original_filename: str,
@@ -53,8 +63,100 @@ async def translate_docx_file(
         _log_status("failed", source_path.name, reason="parse")
         raise DocumentProcessingError("failed to parse DOCX file") from exc
 
+    block_result = await translate_document_blocks(
+        blocks=blocks,
+        document_name=source_path.name,
+        source_lang=source_lang,
+        target_lang=target_lang,
+        settings=settings,
+        document_type="DOCX",
+        progress_callback=progress_callback,
+    )
+
+    output_name = _build_output_name(original_filename, target_lang, ".docx")
+    output_path = settings.output_dir / output_name
+
+    _report_progress(progress_callback, "building", 90, "Building document")
+    _log_status("building", source_path.name)
+    try:
+        build_translated_docx(source_path, output_path, block_result.translations)
+    except Exception as exc:
+        _report_progress(progress_callback, "failed", 100, "Failed to build document")
+        _log_status("failed", source_path.name, reason="build")
+        raise DocumentProcessingError("failed to build translated DOCX file") from exc
+
+    _report_progress(progress_callback, "completed", 100, "Completed")
+    _log_status("completed", source_path.name)
+    return TranslationResult(
+        status="completed",
+        file_name=output_name,
+        file_path=output_path,
+        estimated_characters=block_result.estimated_characters,
+        estimated_tokens=block_result.estimated_tokens,
+    )
+
+
+async def translate_pdf_file(
+    source_path: Path,
+    original_filename: str,
+    source_lang: LanguageCode,
+    target_lang: LanguageCode,
+    settings: Settings,
+    progress_callback: ProgressCallback | None = None,
+) -> TranslationResult:
+    _report_progress(progress_callback, "parsing", 10, "Parsing document")
+    _log_status("parsing", source_path.name)
+    try:
+        blocks = extract_pdf_blocks(source_path)
+    except Exception as exc:
+        _report_progress(progress_callback, "failed", 100, "Failed to parse document")
+        _log_status("failed", source_path.name, reason="parse")
+        raise DocumentProcessingError("failed to parse PDF file") from exc
+
+    block_result = await translate_document_blocks(
+        blocks=blocks,
+        document_name=source_path.name,
+        source_lang=source_lang,
+        target_lang=target_lang,
+        settings=settings,
+        document_type="PDF",
+        progress_callback=progress_callback,
+    )
+
+    output_name = _build_output_name(original_filename, target_lang, ".pdf")
+    output_path = settings.output_dir / output_name
+
+    _report_progress(progress_callback, "building", 90, "Building document")
+    _log_status("building", source_path.name)
+    try:
+        build_pdf(block_result.translated_blocks, output_path.as_posix())
+    except Exception as exc:
+        _report_progress(progress_callback, "failed", 100, "Failed to build document")
+        _log_status("failed", source_path.name, reason="build")
+        raise DocumentProcessingError("failed to build translated PDF file") from exc
+
+    _report_progress(progress_callback, "completed", 100, "Completed")
+    _log_status("completed", source_path.name)
+    return TranslationResult(
+        status="completed",
+        file_name=output_name,
+        file_path=output_path,
+        estimated_characters=block_result.estimated_characters,
+        estimated_tokens=block_result.estimated_tokens,
+    )
+
+
+async def translate_document_blocks(
+    blocks: list[DocumentBlock],
+    document_name: str,
+    source_lang: LanguageCode,
+    target_lang: LanguageCode,
+    settings: Settings,
+    document_type: str,
+    progress_callback: ProgressCallback | None = None,
+) -> BlocksTranslationResult:
     _report_progress(progress_callback, "estimating", 20, "Estimating translation cost")
-    _log_status("estimating", source_path.name)
+    _log_status("estimating", document_name)
     translation_cache = TranslationCache(source_lang, target_lang)
     unique_blocks, duplicate_block_ids = _deduplicate_translatable_blocks(
         blocks,
@@ -87,12 +189,12 @@ async def translate_docx_file(
         )
     except ValueError as exc:
         _report_progress(progress_callback, "failed", 100, "Failed to segment document")
-        _log_status("failed", source_path.name, reason="segment")
-        raise DocumentProcessingError("failed to segment DOCX file") from exc
+        _log_status("failed", document_name, reason="segment")
+        raise DocumentProcessingError(f"failed to segment {document_type} file") from exc
 
     _log_status(
         "estimating",
-        source_path.name,
+        document_name,
         blocks=len(blocks),
         translatable_blocks=len(untranslated_blocks),
         cached_blocks=len(translations),
@@ -104,7 +206,7 @@ async def translate_docx_file(
 
     if batches:
         _report_progress(progress_callback, "translating", 30, "Translating document")
-        _log_status("translating", source_path.name)
+        _log_status("translating", document_name)
         try:
             client = get_translation_client(settings)
             total_batches = len(batches)
@@ -143,8 +245,8 @@ async def translate_docx_file(
                 )
         except AIClientError as exc:
             _report_progress(progress_callback, "failed", 100, "Translation provider failed")
-            _log_status("failed", source_path.name, reason="provider")
-            raise TranslationProviderError("failed to translate DOCX file") from exc
+            _log_status("failed", document_name, reason="provider")
+            raise TranslationProviderError(f"failed to translate {document_type} file") from exc
 
     _apply_cached_duplicate_translations(
         blocks,
@@ -153,33 +255,18 @@ async def translate_docx_file(
         translation_cache,
     )
 
-    output_name = _build_output_name(original_filename, target_lang)
-    output_path = settings.output_dir / output_name
-
-    _report_progress(progress_callback, "building", 90, "Building document")
-    _log_status("building", source_path.name)
-    try:
-        build_translated_docx(source_path, output_path, translations)
-    except Exception as exc:
-        _report_progress(progress_callback, "failed", 100, "Failed to build document")
-        _log_status("failed", source_path.name, reason="build")
-        raise DocumentProcessingError("failed to build translated DOCX file") from exc
-
-    _report_progress(progress_callback, "completed", 100, "Completed")
-    _log_status("completed", source_path.name)
-    return TranslationResult(
-        status="completed",
-        file_name=output_name,
-        file_path=output_path,
+    return BlocksTranslationResult(
+        translations=translations,
+        translated_blocks=_translated_blocks(blocks, translations),
         estimated_characters=cost_estimate.translatable_characters,
         estimated_tokens=cost_estimate.estimated_tokens,
     )
 
 
-def _build_output_name(filename: str, target_lang: LanguageCode) -> str:
+def _build_output_name(filename: str, target_lang: LanguageCode, extension: str) -> str:
     path = Path(filename)
     stem = _sanitize_filename_part(path.stem or "document")
-    return f"{stem}_translated_to_{target_lang}.docx"
+    return f"{stem}_translated_to_{target_lang}{extension}"
 
 
 def _sanitize_filename_part(value: str) -> str:
@@ -337,3 +424,13 @@ def _apply_cached_duplicate_translations(
         )
         if translated_text is not None:
             translations[duplicate_block.block_id] = translated_text
+
+
+def _translated_blocks(
+    blocks: list[DocumentBlock],
+    translations: dict[str, str],
+) -> list[DocumentBlock]:
+    return [
+        block.model_copy(update={"text": translations.get(block.block_id, block.text)})
+        for block in blocks
+    ]
