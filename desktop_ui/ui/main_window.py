@@ -55,8 +55,8 @@ class MainWindow(QMainWindow):
         self.target_language_combo.setCurrentText("ru")
 
         self.pdf_mode_combo = QComboBox()
-        self.pdf_mode_combo.addItem("Simple PDF", PDF_MODE_SIMPLE)
-        self.pdf_mode_combo.addItem("Layout PDF", PDF_MODE_LAYOUT)
+        self.pdf_mode_combo.addItem("Layout PDF (preserve images)", PDF_MODE_LAYOUT)
+        self.pdf_mode_combo.addItem("Text-only PDF", PDF_MODE_SIMPLE)
 
         self.translate_button = QPushButton("Translate")
         self.translate_button.setEnabled(False)

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import zipfile
 from types import SimpleNamespace
 from typing import Literal
@@ -17,6 +18,7 @@ from app.api.download import get_translation_download
 from app.api.estimate import estimate_docx
 from app.api.status import get_translation_status
 from app.api.translate import translate_docx, translate_pdf, translate_pdf_layout
+from app.core.ai_client import OpenAICompatibleClient
 from app.core.cache import RedisTranslationCache, build_cache_key
 from app.core.config import Settings
 from app.core.job_store import InMemoryJobStore
@@ -97,7 +99,7 @@ def test_extract_pdf_layout_blocks_uses_line_level_metadata(tmp_path):
     source_path = tmp_path / "layout.pdf"
     document = fitz.open()
     page = document.new_page()
-    page.insert_text((72, 72), "Hello   layout", fontsize=13)
+    page.insert_text((72, 72), "Hello   layout", fontsize=13, color=(1.0, 0.0, 0.0))
     page.insert_text((72, 96), "Second line", fontsize=9)
     document.save(source_path)
     document.close()
@@ -112,6 +114,7 @@ def test_extract_pdf_layout_blocks_uses_line_level_metadata(tmp_path):
     assert all(len(block.bbox) == 4 for block in blocks)
     assert blocks[0].font_size == pytest.approx(13)
     assert blocks[0].font_name is not None
+    assert blocks[0].color == pytest.approx((1.0, 0.0, 0.0))
     assert blocks[0].translatable is True
 
 
@@ -477,6 +480,7 @@ def test_build_translated_pdf_overlays_translations_and_preserves_pages(tmp_path
         translated_document.close()
 
     assert "Привет PDF" in " ".join(text.split())
+    assert "Hello PDF layout area" not in text
     assert "Second page" in text
 
 
@@ -490,7 +494,7 @@ def test_build_translated_pdf_uses_fitted_text_and_font_size(tmp_path, monkeypat
     blocks = extract_pdf_layout_blocks(source_path)
     calls = []
 
-    def fake_fit_text(text, bbox, font_size):
+    def fake_fit_text(text, bbox, font_size, min_font_size=6.0):
         calls.append((text, bbox, font_size))
         return FittedText(text="Fitted PDF", font_size=7.0, overflow=False)
 
@@ -506,6 +510,30 @@ def test_build_translated_pdf_uses_fitted_text_and_font_size(tmp_path, monkeypat
 
     assert calls == [("Translated PDF", blocks[0].bbox, blocks[0].font_size)]
     assert "Fitted PDF" in " ".join(text.split())
+
+
+def test_build_translated_pdf_uses_source_text_color(tmp_path):
+    source_path = tmp_path / "source-colored.pdf"
+    output_path = tmp_path / "outputs" / "translated.pdf"
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_text((72, 72), "Colored caption", fontsize=12, color=(1.0, 0.0, 0.0))
+    document.save(source_path)
+    document.close()
+    blocks = extract_pdf_layout_blocks(source_path)
+
+    build_translated_pdf(source_path, output_path, blocks, {"p0l1": "Красная подпись"})
+
+    translated_document = fitz.open(output_path)
+    try:
+        text = " ".join(translated_document[0].get_text().split())
+        color = _first_text_color(translated_document[0])
+    finally:
+        translated_document.close()
+
+    assert "Красная подпись" in text
+    assert "Colored caption" not in text
+    assert color == pytest.approx((1.0, 0.0, 0.0))
 
 
 def test_build_translated_pdf_preserves_source_images(tmp_path):
@@ -526,9 +554,48 @@ def test_build_translated_pdf_preserves_source_images(tmp_path):
     translated_document = fitz.open(output_path)
     try:
         assert len(translated_document[0].get_images(full=True)) == 1
-        assert "Подпись" in translated_document[0].get_text()
+        text = translated_document[0].get_text()
+        assert "Подпись" in text
+        assert "Image caption" not in text
     finally:
         translated_document.close()
+
+
+def test_build_translated_pdf_does_not_drop_text_when_translation_overflows(tmp_path):
+    source_path = tmp_path / "source-small-textbox.pdf"
+    output_path = tmp_path / "outputs" / "translated.pdf"
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_text((72, 72), "Short", fontsize=12)
+    document.save(source_path)
+    document.close()
+    long_translation = "Первое второе третье четвертое пятое шестое"
+
+    build_translated_pdf(
+        source_path,
+        output_path,
+        [
+            PDFTextBlock(
+                block_id="p0l1",
+                text="Short",
+                page=0,
+                bbox=(72.0, 72.0, 92.0, 80.0),
+                font_size=12.0,
+                font_name=None,
+                translatable=True,
+            )
+        ],
+        {"p0l1": long_translation},
+    )
+
+    translated_document = fitz.open(output_path)
+    try:
+        text = " ".join(translated_document[0].get_text().split())
+    finally:
+        translated_document.close()
+
+    for word in long_translation.split():
+        assert word in text
 
 
 def test_build_translated_docx_replaces_paragraphs_and_table_cells(tmp_path):
@@ -672,6 +739,41 @@ def test_redis_translation_cache_falls_back_when_redis_is_unavailable():
 
     assert cache.get_translation("translation_cache:missing") is None
     cache.set_translation("translation_cache:missing", "ignored")
+
+
+def test_openai_client_splits_batch_when_response_ids_do_not_match(monkeypatch):
+    client = OpenAICompatibleClient(Settings(openai_api_key="test-key"))
+    responses = [
+        {"translations": [{"id": "b1", "translation": "Привет"}]},
+        {"translations": [{"id": "b1", "translation": "Привет"}]},
+        {"translations": [{"id": "b2", "translation": "Мир"}]},
+    ]
+    requested_ids = []
+
+    async def fake_request_translation(payload, source_lang, target_lang):
+        requested_ids.append(_payload_ids(payload))
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps(responses.pop(0), ensure_ascii=False),
+                    )
+                )
+            ]
+        )
+
+    monkeypatch.setattr(client, "_request_translation", fake_request_translation)
+
+    translations = asyncio.run(
+        client.translate_blocks(
+            [_block("b1", "Hello"), _block("b2", "World")],
+            LanguageCode.EN,
+            LanguageCode.RU,
+        )
+    )
+
+    assert translations == {"b1": "Привет", "b2": "Мир"}
+    assert requested_ids == [["b1", "b2"], ["b1"], ["b2"]]
 
 
 def test_segmenter_respects_batch_limits_and_skips_non_translatable_blocks():
@@ -1883,6 +1985,31 @@ def _block(block_id: str, text: str, translatable: bool = True) -> DocumentBlock
         location=f"test:{block_id}",
         translatable=translatable,
     )
+
+
+def _payload_ids(payload: object) -> list[str]:
+    blocks = payload.get("blocks") if isinstance(payload, dict) else payload
+    return [
+        str(item["id"])
+        for item in blocks
+        if isinstance(item, dict) and "id" in item
+    ]
+
+
+def _first_text_color(page: fitz.Page) -> tuple[float, float, float] | None:
+    raw_page = page.get_text("rawdict")
+    for raw_block in raw_page.get("blocks", []):
+        for raw_line in raw_block.get("lines", []):
+            for span in raw_line.get("spans", []):
+                color = span.get("color")
+                if isinstance(color, int):
+                    return (
+                        ((color >> 16) & 255) / 255,
+                        ((color >> 8) & 255) / 255,
+                        (color & 255) / 255,
+                    )
+
+    return None
 
 
 def _pdf_text_block(

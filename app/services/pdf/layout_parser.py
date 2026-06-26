@@ -24,6 +24,7 @@ class PDFTextBlock:
     font_size: float
     font_name: str | None
     translatable: bool
+    color: tuple[float, float, float] | None = None
 
 
 def extract_pdf_layout_blocks(file_path: str | Path) -> list[PDFTextBlock]:
@@ -65,6 +66,7 @@ def _append_page_lines(
                     font_size=font_size,
                     font_name=font_name,
                     translatable=_is_translatable(text, page_index + 1),
+                    color=_line_color(raw_line),
                 )
             )
 
@@ -115,6 +117,25 @@ def _line_font(raw_line: dict[str, Any]) -> tuple[float, str | None]:
         )
 
     return 0.0, None
+
+
+def _line_color(raw_line: dict[str, Any]) -> tuple[float, float, float] | None:
+    for span in raw_line.get("spans", []):
+        if not _normalize_text(_span_text(span)):
+            continue
+
+        color = span.get("color")
+        if isinstance(color, int):
+            return _rgb_from_int(color)
+
+    return None
+
+
+def _rgb_from_int(value: int) -> tuple[float, float, float]:
+    red = ((value >> 16) & 255) / 255
+    green = ((value >> 8) & 255) / 255
+    blue = (value & 255) / 255
+    return red, green, blue
 
 
 def _normalize_text(text: str) -> str:

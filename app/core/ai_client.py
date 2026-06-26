@@ -39,6 +39,20 @@ class OpenAICompatibleClient:
         if not blocks:
             return {}
 
+        return await self._translate_blocks_batch(
+            blocks,
+            source_lang,
+            target_lang,
+            glossary_terms,
+        )
+
+    async def _translate_blocks_batch(
+        self,
+        blocks: Sequence[DocumentBlock],
+        source_lang: LanguageCode,
+        target_lang: LanguageCode,
+        glossary_terms: Sequence[GlossaryTerm] | None,
+    ) -> dict[str, str]:
         payload = _build_translation_payload(blocks, glossary_terms)
         response = await self._request_translation(payload, source_lang, target_lang)
 
@@ -46,7 +60,26 @@ class OpenAICompatibleClient:
         if not content:
             raise AIClientError("AI API returned an empty response")
 
-        return _parse_translation_response(content, blocks)
+        try:
+            return _parse_translation_response(content, blocks)
+        except AIClientError as exc:
+            if len(blocks) <= 1 or not _is_parse_error(exc):
+                raise
+
+        midpoint = len(blocks) // 2
+        left = await self._translate_blocks_batch(
+            blocks[:midpoint],
+            source_lang,
+            target_lang,
+            glossary_terms,
+        )
+        right = await self._translate_blocks_batch(
+            blocks[midpoint:],
+            source_lang,
+            target_lang,
+            glossary_terms,
+        )
+        return {**left, **right}
 
     async def _request_translation(
         self,
@@ -149,6 +182,16 @@ def _parse_translation_response(
 
 def _is_retryable_status(exc: APIStatusError) -> bool:
     return exc.status_code in {408, 409, 429} or exc.status_code >= 500
+
+
+def _is_parse_error(exc: AIClientError) -> bool:
+    return str(exc) in {
+        "AI API returned invalid JSON",
+        "AI API response must be a translations array",
+        "AI API returned an invalid translation item",
+        "AI API translation item has invalid fields",
+        "AI API response ids do not match source ids",
+    }
 
 
 class MockAIClient:
