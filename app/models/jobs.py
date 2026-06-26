@@ -14,6 +14,7 @@ class JobStatus(StrEnum):
     EXTRACTING_TEXT = "extracting_text"
     ESTIMATING = "estimating"
     TRANSLATING = "translating"
+    NEEDS_REVIEW = "needs_review"
     BUILDING = "building"
     REBUILDING_PDF = "rebuilding_pdf"
     COMPLETED = "completed"

@@ -16,6 +16,7 @@ from redis.exceptions import RedisError
 
 from app.api.download import get_translation_download
 from app.api.estimate import estimate_docx
+from app.api.review import build_from_review_file, complete_review, get_review_draft
 from app.api.status import get_translation_status
 from app.api.translate import translate_docx, translate_pdf, translate_pdf_layout
 from app.core.ai_client import OpenAICompatibleClient
@@ -25,7 +26,15 @@ from app.core.job_store import InMemoryJobStore
 from app.core.progress_events import build_progress_event
 from app.main import app
 from app.models.jobs import JobStatus, TranslationJob
-from app.models.schemas import DocumentBlock, LanguageCode
+from app.models.schemas import (
+    DocumentBlock,
+    LanguageCode,
+    ReviewBuildFromFileRequest,
+    ReviewCompleteRequest,
+    ReviewDraft,
+    ReviewDraftBlock,
+    ReviewFile,
+)
 from app.services.builder import build_translated_docx
 from app.services.cost_estimator import estimate_translation_cost
 from app.services.docx_parser import extract_docx_blocks
@@ -33,6 +42,7 @@ from app.services.pdf.builder import build_pdf
 from app.services.pdf.fit_engine import FittedText, fit_text
 from app.services.pdf.layout_builder import build_translated_pdf
 from app.services.pdf.layout_parser import PDFTextBlock, extract_pdf_layout_blocks
+from app.services.pdf.review import load_review_draft, save_review_draft
 from app.services.pdf.parser import extract_pdf_blocks
 from app.services.pdf.translator import (
     pdf_text_blocks_to_document_blocks,
@@ -1707,6 +1717,177 @@ def test_download_endpoint_returns_404_when_result_file_is_missing(tmp_path, mon
     assert exc_info.value.detail == "translation result file not found"
 
 
+def test_review_get_returns_saved_draft(tmp_path, monkeypatch):
+    store = InMemoryJobStore()
+    settings = Settings(
+        tmp_dir=tmp_path / "tmp",
+        translation_memory_db_path=tmp_path / "memory.sqlite3",
+    )
+    store.create_job(
+        _job(
+            "job-review",
+            status=JobStatus.NEEDS_REVIEW,
+            progress=85,
+            file_type="pdf_layout",
+        )
+    )
+    save_review_draft(settings, _review_draft("job-review", tmp_path))
+    monkeypatch.setattr("app.api.review.get_job_store", lambda: store)
+    monkeypatch.setattr("app.api.review.get_settings", lambda: settings)
+
+    response = get_review_draft("job-review")
+
+    assert response.job_id == "job-review"
+    assert response.file_type == "pdf_layout"
+    assert response.blocks[0].block_id == "p0l1"
+    assert response.blocks[0].translated_text == "Авто перевод"
+
+
+def test_review_complete_builds_pdf_and_updates_job(tmp_path, monkeypatch):
+    store = InMemoryJobStore()
+    source_path = tmp_path / "review-source.pdf"
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_text((72, 72), "Original line", fontsize=12)
+    page.insert_text((72, 96), "BrandName", fontsize=12)
+    document.save(source_path)
+    document.close()
+    layout_blocks = extract_pdf_layout_blocks(source_path)
+    settings = Settings(
+        output_dir=tmp_path / "outputs",
+        tmp_dir=tmp_path / "tmp",
+        translation_memory_db_path=tmp_path / "memory.sqlite3",
+    )
+    store.create_job(
+        _job(
+            "job-review-complete",
+            status=JobStatus.NEEDS_REVIEW,
+            progress=85,
+            file_type="pdf_layout",
+        )
+    )
+    draft = ReviewDraft(
+        job_id="job-review-complete",
+        source_pdf_path=source_path.as_posix(),
+        original_filename="review-source.pdf",
+        target_lang=LanguageCode.RU,
+        blocks=[
+            _review_block(layout_blocks[0], translated_text="Авто перевод"),
+            _review_block(layout_blocks[1], translated_text="Бренд"),
+        ],
+    )
+    save_review_draft(settings, draft)
+    monkeypatch.setattr("app.api.review.get_job_store", lambda: store)
+    monkeypatch.setattr("app.api.review.get_settings", lambda: settings)
+
+    response = complete_review(
+        "job-review-complete",
+        ReviewCompleteRequest(
+            blocks=[
+                {
+                    "block_id": "p0l1",
+                    "translated_text": "Ручной перевод",
+                    "font_size": 10.5,
+                    "color": [0.0, 0.0, 1.0],
+                    "keep_original": False,
+                },
+                {
+                    "block_id": "p0l2",
+                    "translated_text": "Игнорируется",
+                    "keep_original": True,
+                },
+            ]
+        ),
+    )
+
+    completed_job = store.get_job("job-review-complete")
+    assert response["status"] == JobStatus.COMPLETED
+    assert completed_job is not None
+    assert completed_job.status == JobStatus.COMPLETED
+    assert completed_job.result_file is not None
+    translated_pdf = fitz.open(completed_job.result_file)
+    try:
+        text = " ".join(translated_pdf[0].get_text().split())
+    finally:
+        translated_pdf.close()
+    assert "Ручной перевод" in text
+    assert "BrandName" in text
+    assert "Original line" not in text
+
+
+def test_review_complete_rejects_unknown_block_id(tmp_path, monkeypatch):
+    store = InMemoryJobStore()
+    settings = Settings(
+        tmp_dir=tmp_path / "tmp",
+        translation_memory_db_path=tmp_path / "memory.sqlite3",
+    )
+    store.create_job(
+        _job(
+            "job-review-unknown",
+            status=JobStatus.NEEDS_REVIEW,
+            progress=85,
+            file_type="pdf_layout",
+        )
+    )
+    save_review_draft(settings, _review_draft("job-review-unknown", tmp_path))
+    monkeypatch.setattr("app.api.review.get_job_store", lambda: store)
+    monkeypatch.setattr("app.api.review.get_settings", lambda: settings)
+
+    with pytest.raises(HTTPException) as exc_info:
+        complete_review(
+            "job-review-unknown",
+            ReviewCompleteRequest(
+                blocks=[{"block_id": "missing", "translated_text": "Text"}]
+            ),
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "unknown block_id" in exc_info.value.detail
+    review_job = store.get_job("job-review-unknown")
+    assert review_job is not None
+    assert review_job.status == JobStatus.NEEDS_REVIEW
+
+
+def test_review_build_from_file_builds_pdf_without_active_job(tmp_path, monkeypatch):
+    source_path = tmp_path / "review-file-source.pdf"
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_text((72, 72), "Original line", fontsize=12)
+    document.save(source_path)
+    document.close()
+    layout_blocks = extract_pdf_layout_blocks(source_path)
+    settings = Settings(
+        output_dir=tmp_path / "outputs",
+        tmp_dir=tmp_path / "tmp",
+        translation_memory_db_path=tmp_path / "memory.sqlite3",
+    )
+    monkeypatch.setattr("app.api.review.get_settings", lambda: settings)
+
+    response = build_from_review_file(
+        ReviewBuildFromFileRequest(
+            review=ReviewFile(
+                job_id="saved-review",
+                source_pdf_path=source_path.as_posix(),
+                original_filename="review-file-source.pdf",
+                target_lang=LanguageCode.RU,
+                blocks=[
+                    _review_block(layout_blocks[0], translated_text="Сохранённый перевод")
+                ],
+            )
+        )
+    )
+
+    assert response["status"] == "completed"
+    result_path = response["result_file"]
+    translated_pdf = fitz.open(result_path)
+    try:
+        text = " ".join(translated_pdf[0].get_text().split())
+    finally:
+        translated_pdf.close()
+    assert "Сохранённый перевод" in text
+    assert "Original line" not in text
+
+
 def test_stream_endpoint_returns_sse_headers(monkeypatch):
     store = InMemoryJobStore()
     store.create_job(
@@ -1896,7 +2077,7 @@ def test_worker_processes_pdf_translation_job_with_mock_ai(tmp_path, monkeypatch
     assert "Hello PDF [ru]" in text
 
 
-def test_worker_processes_pdf_layout_translation_job_with_mock_ai(tmp_path, monkeypatch):
+def test_worker_processes_pdf_layout_translation_job_creates_review_draft(tmp_path, monkeypatch):
     store = InMemoryJobStore()
     source_path = tmp_path / "worker-layout.pdf"
     document = fitz.open()
@@ -1928,20 +2109,24 @@ def test_worker_processes_pdf_layout_translation_job_with_mock_ai(tmp_path, monk
 
     process_pdf_layout_translation_job("job-pdf-layout-worker")
 
-    completed_job = store.get_job("job-pdf-layout-worker")
-    assert completed_job is not None
-    assert completed_job.status == JobStatus.COMPLETED
-    assert completed_job.progress == 100
-    assert completed_job.result_file is not None
-    assert completed_job.result_file.endswith(".pdf")
+    review_job = store.get_job("job-pdf-layout-worker")
+    assert review_job is not None
+    assert review_job.status == JobStatus.NEEDS_REVIEW
+    assert review_job.progress == 85
+    assert review_job.result_file is None
 
-    translated_pdf = fitz.open(completed_job.result_file)
-    try:
-        text = "\n".join(page.get_text() for page in translated_pdf)
-    finally:
-        translated_pdf.close()
-
-    assert "Hello layout PDF [ru]" in " ".join(text.split())
+    draft = load_review_draft(
+        Settings(
+            tmp_dir=tmp_path / "tmp",
+            translation_memory_db_path=tmp_path / "memory.sqlite3",
+        ),
+        "job-pdf-layout-worker",
+    )
+    assert draft is not None
+    assert draft.job_id == "job-pdf-layout-worker"
+    assert draft.file_type == "pdf_layout"
+    assert draft.blocks[0].source_text == "Hello layout PDF"
+    assert draft.blocks[0].translated_text == "Hello layout PDF [ru]"
 
 
 def test_worker_failed_job_stores_safe_error(tmp_path, monkeypatch):
@@ -2025,6 +2210,54 @@ def _pdf_text_block(
         font_size=12.0,
         font_name="Helvetica",
         translatable=translatable,
+    )
+
+
+def _review_draft(job_id: str, tmp_path) -> ReviewDraft:
+    source_path = tmp_path / f"{job_id}.pdf"
+    if not source_path.exists():
+        document = fitz.open()
+        document.new_page().insert_text((72, 72), "Original line", fontsize=12)
+        document.save(source_path)
+        document.close()
+    return ReviewDraft(
+        job_id=job_id,
+        source_pdf_path=source_path.as_posix(),
+        original_filename="source.pdf",
+        target_lang=LanguageCode.RU,
+        blocks=[
+            ReviewDraftBlock(
+                block_id="p0l1",
+                page=0,
+                source_text="Original line",
+                translated_text="Авто перевод",
+                bbox=(72.0, 60.0, 160.0, 80.0),
+                font_size=12.0,
+                font_name="Helvetica",
+                color=(0.0, 0.0, 0.0),
+                translatable=True,
+                keep_original=False,
+            )
+        ],
+    )
+
+
+def _review_block(
+    block: PDFTextBlock,
+    translated_text: str,
+    keep_original: bool = False,
+) -> ReviewDraftBlock:
+    return ReviewDraftBlock(
+        block_id=block.block_id,
+        page=block.page,
+        source_text=block.text,
+        translated_text=translated_text,
+        bbox=block.bbox,
+        font_size=block.font_size,
+        font_name=block.font_name,
+        color=block.color,
+        translatable=block.translatable,
+        keep_original=keep_original,
     )
 
 

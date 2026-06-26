@@ -7,6 +7,7 @@ from app.core.config import get_settings
 from app.core.job_store import get_job_store
 from app.core.progress_events import build_progress_event, get_progress_event_store
 from app.models.jobs import JobStatus
+from app.services.pdf.review import create_pdf_layout_review_draft
 from app.services.pdf.translator import translate_pdf_layout_file
 from app.services.translator import (
     DocumentProcessingError,
@@ -75,7 +76,7 @@ def run_pdf_layout_translation_job(self, job_id: str) -> dict[str, str]:
         _mark_failed(job_id, "translation provider failed")
         raise
 
-    return {"job_id": job_id, "status": JobStatus.COMPLETED}
+    return {"job_id": job_id, "status": JobStatus.NEEDS_REVIEW}
 
 
 def process_translation_job(job_id: str) -> None:
@@ -174,8 +175,9 @@ def process_pdf_layout_translation_job(job_id: str) -> None:
     settings = get_settings()
 
     try:
-        result = asyncio.run(
-            translate_pdf_layout_file(
+        asyncio.run(
+            create_pdf_layout_review_draft(
+                job_id=job_id,
                 source_path=Path(job.upload_path),
                 original_filename=job.original_filename,
                 source_lang=job.source_lang,
@@ -200,9 +202,9 @@ def process_pdf_layout_translation_job(job_id: str) -> None:
 
     job_store.update_job(
         job_id,
-        status=JobStatus.COMPLETED,
-        progress=100,
-        result_file=result.file_path.as_posix(),
+        status=JobStatus.NEEDS_REVIEW,
+        progress=85,
+        result_file=None,
         error=None,
     )
 

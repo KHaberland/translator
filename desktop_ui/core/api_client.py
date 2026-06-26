@@ -103,6 +103,41 @@ class ApiClient:
 
         return self._json_response(response, "Status request failed")
 
+    def get_review_draft(self, job_id: str) -> dict[str, Any]:
+        url = f"{self.base_url}/review/{job_id}"
+        try:
+            response = requests.get(url, timeout=self.timeout)
+        except requests.RequestException as exc:
+            raise ApiClientError(self._request_error_message(exc)) from exc
+
+        return self._json_response(response, "Review draft request failed")
+
+    def complete_review(self, job_id: str, blocks: list[dict[str, Any]]) -> dict[str, Any]:
+        url = f"{self.base_url}/review/{job_id}/complete"
+        try:
+            response = requests.post(
+                url,
+                json={"blocks": blocks},
+                timeout=self.timeout,
+            )
+        except requests.RequestException as exc:
+            raise ApiClientError(self._request_error_message(exc)) from exc
+
+        return self._json_response(response, "Review completion failed")
+
+    def build_from_review_file(self, review: dict[str, Any]) -> dict[str, Any]:
+        url = f"{self.base_url}/review/build-from-file"
+        try:
+            response = requests.post(
+                url,
+                json={"review": review},
+                timeout=self.timeout,
+            )
+        except requests.RequestException as exc:
+            raise ApiClientError(self._request_error_message(exc)) from exc
+
+        return self._json_response(response, "Review file build failed")
+
     def download(
         self,
         job_id: str,
@@ -230,9 +265,16 @@ class ApiClient:
             "translation result file not found": "Result file not found",
             "translation provider failed": "Translation failed",
             "failed to process DOCX file": "Translation failed",
+            "failed to process PDF layout file": "Translation failed",
             "translation queue is unavailable": "Backend queue is unavailable",
             "file is too large": "File is too large",
             "failed to process PDF file": "Translation failed",
+            "review draft not found": "Review draft not found",
+            "translation job is not awaiting review": "Review is not available",
+            "review is available only for layout PDF jobs": "Review is available only for layout PDF jobs",
+            "unsupported review file version": "Unsupported review file version",
+            "review file is invalid": "Review file is invalid",
+            "original PDF not found": "Original PDF not found",
         }
         if detail in known_details:
             return known_details[detail]

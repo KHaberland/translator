@@ -5,6 +5,7 @@ from fastapi import FastAPI
 
 from app.api.download import router as download_router
 from app.api.estimate import router as estimate_router
+from app.api.review import router as review_router
 from app.api.status import router as status_router
 from app.api.stream import router as stream_router
 from app.api.translate import router as translate_router
@@ -32,4 +33,5 @@ app.include_router(translate_router)
 app.include_router(estimate_router)
 app.include_router(status_router)
 app.include_router(stream_router)
+app.include_router(review_router)
 app.include_router(download_router)

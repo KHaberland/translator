@@ -2,6 +2,11 @@ import pytest
 import requests
 
 from desktop_ui.core.api_client import ApiClient, ApiClientError
+from desktop_ui.ui.review_file import (
+    build_review_file_payload,
+    validate_review_file_payload,
+)
+from desktop_ui.ui.review_overflow import text_overflows_original_width
 
 
 def test_api_client_estimate_returns_dict(tmp_path, monkeypatch):
@@ -259,6 +264,101 @@ def test_api_client_estimate_timeout_is_short_message(tmp_path, monkeypatch):
 
     with pytest.raises(ApiClientError, match="Request timed out"):
         ApiClient(base_url="http://backend").estimate(str(docx_path), "en", "ru")
+
+
+def test_api_client_build_from_review_file_posts_review_payload(monkeypatch):
+    response = _Response(
+        ok=True,
+        status_code=200,
+        payload={"status": "completed", "result_file": "outputs/result.pdf"},
+    )
+    calls = []
+
+    def fake_post(url, json, timeout):
+        calls.append((url, json, timeout))
+        return response
+
+    monkeypatch.setattr(requests, "post", fake_post)
+
+    payload = ApiClient(base_url="http://backend", timeout=5).build_from_review_file(
+        {"version": 1, "file_type": "pdf_layout", "blocks": []}
+    )
+
+    assert payload == response._payload
+    assert calls == [
+        (
+            "http://backend/review/build-from-file",
+            {"review": {"version": 1, "file_type": "pdf_layout", "blocks": []}},
+            5,
+        )
+    ]
+
+
+def test_build_review_file_payload_preserves_manual_edits(tmp_path):
+    source_path = tmp_path / "source.pdf"
+    source_path.write_bytes(b"%PDF-1.4\n")
+    payload = build_review_file_payload(
+        {
+            "job_id": "job-1",
+            "source_pdf_path": str(source_path),
+            "original_filename": "source.pdf",
+            "target_lang": "ru",
+            "blocks": [
+                {
+                    "block_id": "p0l1",
+                    "page": 0,
+                    "source_text": "Original",
+                    "translated_text": "Auto",
+                    "bbox": [0.0, 0.0, 100.0, 12.0],
+                    "font_size": 12.0,
+                    "color": [0.0, 0.0, 0.0],
+                    "translatable": True,
+                    "keep_original": False,
+                }
+            ],
+        },
+        [
+            {
+                "block_id": "p0l1",
+                "translated_text": "Manual",
+                "font_size": 10.5,
+                "color": [1.0, 0.0, 0.0],
+                "keep_original": True,
+            }
+        ],
+    )
+
+    restored = validate_review_file_payload(payload)
+
+    assert restored["version"] == 1
+    assert restored["blocks"][0]["translated_text"] == "Manual"
+    assert restored["blocks"][0]["font_size"] == 10.5
+    assert restored["blocks"][0]["color"] == [1.0, 0.0, 0.0]
+    assert restored["blocks"][0]["keep_original"] is True
+
+
+def test_review_overflow_allows_text_inside_original_width():
+    assert text_overflows_original_width(
+        text="Short",
+        bbox=(0.0, 0.0, 100.0, 12.0),
+        font_size=12.0,
+    ) is False
+
+
+def test_review_overflow_detects_text_longer_than_original_width():
+    assert text_overflows_original_width(
+        text="This translated text is too long",
+        bbox=(0.0, 0.0, 80.0, 12.0),
+        font_size=12.0,
+    ) is True
+
+
+def test_review_overflow_ignores_invalid_geometry():
+    assert text_overflows_original_width(
+        text="Long text",
+        bbox=None,
+        font_size=12.0,
+    ) is False
 
 
 class _Response:

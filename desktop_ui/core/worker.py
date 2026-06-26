@@ -90,6 +90,7 @@ class PollingWorker(QThread):
     status_signal = Signal(str)
     progress_signal = Signal(int)
     completed_signal = Signal(dict)
+    needs_review_signal = Signal(dict)
     failed_signal = Signal(str)
     error_signal = Signal(str)
 
@@ -126,6 +127,9 @@ class PollingWorker(QThread):
 
             if status == "completed":
                 self.completed_signal.emit(payload)
+                return
+            if status == "needs_review":
+                self.needs_review_signal.emit(payload)
                 return
             if status == "failed":
                 error = payload.get("error")
@@ -172,3 +176,92 @@ class DownloadWorker(QThread):
             return
 
         self.downloaded_signal.emit(saved_path)
+
+
+class ReviewLoadWorker(QThread):
+    started_signal = Signal()
+    loaded_signal = Signal(dict)
+    error_signal = Signal(str)
+
+    def __init__(
+        self,
+        job_id: str,
+        api_client: ApiClient | None = None,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.job_id = job_id
+        self.api_client = api_client or ApiClient()
+
+    def run(self) -> None:
+        self.started_signal.emit()
+        try:
+            payload = self.api_client.get_review_draft(self.job_id)
+        except ApiClientError as exc:
+            self.error_signal.emit(str(exc))
+            return
+        except Exception as exc:
+            self.error_signal.emit(f"Unexpected review loading error: {exc}")
+            return
+
+        self.loaded_signal.emit(payload)
+
+
+class ReviewCompleteWorker(QThread):
+    started_signal = Signal()
+    completed_signal = Signal(dict)
+    error_signal = Signal(str)
+
+    def __init__(
+        self,
+        job_id: str,
+        blocks: list[dict[str, Any]],
+        api_client: ApiClient | None = None,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.job_id = job_id
+        self.blocks = blocks
+        self.api_client = api_client or ApiClient()
+
+    def run(self) -> None:
+        self.started_signal.emit()
+        try:
+            payload = self.api_client.complete_review(self.job_id, self.blocks)
+        except ApiClientError as exc:
+            self.error_signal.emit(str(exc))
+            return
+        except Exception as exc:
+            self.error_signal.emit(f"Unexpected review completion error: {exc}")
+            return
+
+        self.completed_signal.emit(payload)
+
+
+class ReviewFileBuildWorker(QThread):
+    started_signal = Signal()
+    completed_signal = Signal(dict)
+    error_signal = Signal(str)
+
+    def __init__(
+        self,
+        review: dict[str, Any],
+        api_client: ApiClient | None = None,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.review = review
+        self.api_client = api_client or ApiClient()
+
+    def run(self) -> None:
+        self.started_signal.emit()
+        try:
+            payload = self.api_client.build_from_review_file(self.review)
+        except ApiClientError as exc:
+            self.error_signal.emit(str(exc))
+            return
+        except Exception as exc:
+            self.error_signal.emit(f"Unexpected review file build error: {exc}")
+            return
+
+        self.completed_signal.emit(payload)

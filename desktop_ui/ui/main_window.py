@@ -1,27 +1,326 @@
+import json
 from pathlib import Path
+from shutil import copyfile
 
-from PySide6.QtCore import QThread, Qt
-from PySide6.QtGui import QCloseEvent
+from PySide6.QtCore import QModelIndex, QThread, Qt
+from PySide6.QtGui import QColor, QCloseEvent, QPainter, QPen
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
+    QDialog,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
 from desktop_ui.core.api_client import PDF_MODE_LAYOUT, PDF_MODE_SIMPLE
-from desktop_ui.core.worker import DownloadWorker, EstimateWorker, PollingWorker, UploadWorker
+from desktop_ui.core.worker import (
+    DownloadWorker,
+    EstimateWorker,
+    PollingWorker,
+    ReviewCompleteWorker,
+    ReviewFileBuildWorker,
+    ReviewLoadWorker,
+    UploadWorker,
+)
+from desktop_ui.ui.review_file import (
+    REVIEW_FILE_FILTER,
+    build_review_file_payload,
+    validate_review_file_payload,
+)
+from desktop_ui.ui.review_overflow import text_overflows_original_width
 
 
 LANGUAGES = ["en", "ru", "lv", "lt", "et"]
 SUPPORTED_EXTENSIONS = {".docx", ".pdf"}
+REVIEW_COLUMNS = {
+    "page": 0,
+    "original": 1,
+    "translated": 2,
+    "font_size": 3,
+    "color": 4,
+    "keep_original": 5,
+}
+OVERFLOW_ROLE = Qt.ItemDataRole.UserRole + 1
+OVERFLOW_TOOLTIP = "Text is longer than the original line area at the original font size"
+
+
+class OverflowFrameDelegate(QStyledItemDelegate):
+    def paint(
+        self,
+        painter: QPainter,
+        option: QStyleOptionViewItem,
+        index: QModelIndex,
+    ) -> None:
+        super().paint(painter, option, index)
+        if index.column() != REVIEW_COLUMNS["translated"] or not index.data(OVERFLOW_ROLE):
+            return
+
+        painter.save()
+        painter.setPen(QPen(QColor("red"), 2))
+        painter.drawRect(option.rect.adjusted(1, 1, -2, -2))
+        painter.restore()
+
+
+class ReviewDialog(QDialog):
+    def __init__(self, draft: dict, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Review translation")
+        self.resize(1100, 650)
+        self.draft = draft
+        self.blocks = list(draft.get("blocks", []))
+        self.build_requested = False
+
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Search original or translation")
+        self.translatable_only_checkbox = QCheckBox("Only translatable rows")
+        self.table = QTableWidget(0, len(REVIEW_COLUMNS))
+        self.table.setItemDelegate(OverflowFrameDelegate(self.table))
+        self.table.setHorizontalHeaderLabels(
+            [
+                "Page",
+                "Original text",
+                "Translated text",
+                "Font size",
+                "Color",
+                "Keep original",
+            ]
+        )
+        self.table.setWordWrap(True)
+        self.overflow_hint_label = QLabel(
+            "Red border means the text is longer than the original line area at the original font size."
+        )
+        self.overflow_hint_label.setWordWrap(True)
+
+        self.build_button = QPushButton("Build PDF")
+        self.save_button = QPushButton("Save review file")
+        self.cancel_button = QPushButton("Cancel")
+        self._build_layout()
+        self._populate_table()
+        self._connect_signals()
+
+    def review_updates(self) -> list[dict]:
+        updates: list[dict] = []
+        for row, block in enumerate(self.blocks):
+            keep_checkbox = self.table.cellWidget(row, REVIEW_COLUMNS["keep_original"])
+            keep_original = (
+                keep_checkbox.isChecked()
+                if isinstance(keep_checkbox, QCheckBox)
+                else bool(block.get("keep_original", False))
+            )
+            updates.append(
+                {
+                    "block_id": str(block.get("block_id", "")),
+                    "translated_text": self._item_text(row, "translated"),
+                    "font_size": self._font_size(row, block),
+                    "color": self._color(row, block),
+                    "keep_original": keep_original,
+                }
+            )
+        return updates
+
+    def _build_layout(self) -> None:
+        layout = QVBoxLayout(self)
+        filter_layout = QHBoxLayout()
+        filter_layout.addWidget(self.search_input)
+        filter_layout.addWidget(self.translatable_only_checkbox)
+
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+        button_layout.addWidget(self.save_button)
+        button_layout.addWidget(self.build_button)
+        button_layout.addWidget(self.cancel_button)
+
+        layout.addLayout(filter_layout)
+        layout.addWidget(self.overflow_hint_label)
+        layout.addWidget(self.table)
+        layout.addLayout(button_layout)
+
+    def _populate_table(self) -> None:
+        self.table.setRowCount(len(self.blocks))
+        for row, block in enumerate(self.blocks):
+            self._set_readonly_item(row, "page", str(block.get("page", "")))
+            self._set_readonly_item(row, "original", str(block.get("source_text", "")))
+            self.table.setItem(
+                row,
+                REVIEW_COLUMNS["translated"],
+                QTableWidgetItem(str(block.get("translated_text", ""))),
+            )
+            self.table.setItem(
+                row,
+                REVIEW_COLUMNS["font_size"],
+                QTableWidgetItem(str(block.get("font_size", ""))),
+            )
+            self.table.setItem(
+                row,
+                REVIEW_COLUMNS["color"],
+                QTableWidgetItem(self._format_color(block.get("color"))),
+            )
+            keep_checkbox = QCheckBox()
+            keep_checkbox.setChecked(bool(block.get("keep_original", False)))
+            keep_checkbox.setEnabled(bool(block.get("translatable", True)))
+            keep_checkbox.stateChanged.connect(self._update_overflow_indicators)
+            self.table.setCellWidget(row, REVIEW_COLUMNS["keep_original"], keep_checkbox)
+        self.table.resizeColumnsToContents()
+        self._update_overflow_indicators()
+
+    def _connect_signals(self) -> None:
+        self.search_input.textChanged.connect(self._apply_filters)
+        self.translatable_only_checkbox.stateChanged.connect(self._apply_filters)
+        self.table.itemChanged.connect(self._handle_review_item_changed)
+        self.save_button.clicked.connect(self._save_review_file)
+        self.build_button.clicked.connect(self._accept_build)
+        self.cancel_button.clicked.connect(self.reject)
+
+    def review_file_payload(self) -> dict:
+        return build_review_file_payload(self.draft, self.review_updates())
+
+    def _save_review_file(self) -> None:
+        try:
+            payload = self.review_file_payload()
+        except ValueError as exc:
+            QMessageBox.warning(self, "Review error", str(exc))
+            return
+
+        save_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save review file",
+            self._default_review_file_path(),
+            REVIEW_FILE_FILTER,
+        )
+        if not save_path:
+            return
+        if not save_path.lower().endswith(".pdfreview.json"):
+            save_path = f"{save_path}.pdfreview.json"
+
+        try:
+            Path(save_path).write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            QMessageBox.warning(self, "Review error", f"Failed to save review file: {exc}")
+
+    def _default_review_file_path(self) -> str:
+        original_filename = str(self.draft.get("original_filename", "review.pdf"))
+        job_id = str(self.draft.get("job_id", "manual")) or "manual"
+        filename = f"{Path(original_filename).stem}_translated_review_{job_id}.pdfreview.json"
+        return str(Path.home() / filename)
+
+    def _handle_review_item_changed(self, item: QTableWidgetItem) -> None:
+        if item.column() in {
+            REVIEW_COLUMNS["translated"],
+            REVIEW_COLUMNS["font_size"],
+        }:
+            self._update_overflow_indicators()
+
+    def _update_overflow_indicators(self) -> None:
+        signals_were_blocked = self.table.blockSignals(True)
+        try:
+            for row, block in enumerate(self.blocks):
+                translated_item = self.table.item(row, REVIEW_COLUMNS["translated"])
+                font_size_item = self.table.item(row, REVIEW_COLUMNS["font_size"])
+                if translated_item is None:
+                    continue
+
+                keep_checkbox = self.table.cellWidget(row, REVIEW_COLUMNS["keep_original"])
+                keep_original = (
+                    keep_checkbox.isChecked()
+                    if isinstance(keep_checkbox, QCheckBox)
+                    else bool(block.get("keep_original", False))
+                )
+                text = (
+                    str(block.get("source_text", ""))
+                    if keep_original
+                    else translated_item.text()
+                )
+                font_size = self._overflow_font_size(block)
+                overflows = text_overflows_original_width(text, block.get("bbox"), font_size)
+                translated_item.setData(OVERFLOW_ROLE, overflows)
+                translated_item.setToolTip(OVERFLOW_TOOLTIP if overflows else "")
+                if font_size_item is not None:
+                    font_size_item.setToolTip(OVERFLOW_TOOLTIP if overflows else "")
+        finally:
+            self.table.blockSignals(signals_were_blocked)
+        self.table.viewport().update()
+
+    def _overflow_font_size(self, block: dict) -> float:
+        try:
+            return float(block.get("font_size", 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _apply_filters(self) -> None:
+        query = self.search_input.text().strip().lower()
+        translatable_only = self.translatable_only_checkbox.isChecked()
+        for row, block in enumerate(self.blocks):
+            text = (
+                f"{block.get('source_text', '')} {self._item_text(row, 'translated')}"
+                .lower()
+            )
+            hidden = bool(query and query not in text)
+            hidden = hidden or (
+                translatable_only and not bool(block.get("translatable", True))
+            )
+            self.table.setRowHidden(row, hidden)
+
+    def _accept_build(self) -> None:
+        try:
+            self.review_updates()
+        except ValueError as exc:
+            QMessageBox.warning(self, "Review error", str(exc))
+            return
+        self.build_requested = True
+        self.accept()
+
+    def _set_readonly_item(self, row: int, column: str, text: str) -> None:
+        item = QTableWidgetItem(text)
+        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+        self.table.setItem(row, REVIEW_COLUMNS[column], item)
+
+    def _item_text(self, row: int, column: str) -> str:
+        item = self.table.item(row, REVIEW_COLUMNS[column])
+        return item.text() if item is not None else ""
+
+    def _font_size(self, row: int, block: dict) -> float:
+        raw_value = self._item_text(row, "font_size").strip()
+        try:
+            value = float(raw_value)
+        except ValueError as exc:
+            raise ValueError("Font size must be a number") from exc
+        if value <= 0:
+            raise ValueError("Font size must be greater than zero")
+        return value
+
+    def _color(self, row: int, block: dict) -> list[float] | None:
+        raw_value = self._item_text(row, "color").strip()
+        if not raw_value:
+            return block.get("color")
+        try:
+            values = [float(part.strip()) for part in raw_value.split(",")]
+        except ValueError as exc:
+            raise ValueError("Color must be three numbers: r,g,b") from exc
+        if len(values) != 3 or any(value < 0 or value > 1 for value in values):
+            raise ValueError("Color values must be between 0 and 1")
+        return values
+
+    @staticmethod
+    def _format_color(color: object) -> str:
+        if not isinstance(color, (list, tuple)) or len(color) != 3:
+            return ""
+        return ",".join(f"{float(value):.3f}" for value in color)
 
 
 class MainWindow(QMainWindow):
@@ -37,6 +336,9 @@ class MainWindow(QMainWindow):
         self.upload_worker: UploadWorker | None = None
         self.polling_worker: PollingWorker | None = None
         self.download_worker: DownloadWorker | None = None
+        self.review_load_worker: ReviewLoadWorker | None = None
+        self.review_complete_worker: ReviewCompleteWorker | None = None
+        self.review_file_build_worker: ReviewFileBuildWorker | None = None
 
         self.setWindowTitle("Document Translator MVP")
         self.resize(720, 360)
@@ -61,6 +363,8 @@ class MainWindow(QMainWindow):
         self.translate_button = QPushButton("Translate")
         self.translate_button.setEnabled(False)
 
+        self.load_review_file_button = QPushButton("Load review file")
+
         self.estimate_button = QPushButton("Estimate cost")
         self.estimate_button.setEnabled(False)
 
@@ -77,6 +381,8 @@ class MainWindow(QMainWindow):
 
         self.download_button = QPushButton("Download result")
         self.download_button.setEnabled(False)
+        self.review_button = QPushButton("Review translation")
+        self.review_button.setEnabled(False)
 
         self._build_layout()
         self._connect_signals()
@@ -103,6 +409,8 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(self.message_label)
         main_layout.addWidget(self.estimate_button)
         main_layout.addWidget(self.translate_button)
+        main_layout.addWidget(self.load_review_file_button)
+        main_layout.addWidget(self.review_button)
         main_layout.addWidget(self.download_button)
         main_layout.addStretch()
 
@@ -115,6 +423,8 @@ class MainWindow(QMainWindow):
         self.pdf_mode_combo.currentIndexChanged.connect(self._handle_pdf_mode_change)
         self.estimate_button.clicked.connect(self._start_estimate)
         self.translate_button.clicked.connect(self._start_upload)
+        self.load_review_file_button.clicked.connect(self._load_review_file)
+        self.review_button.clicked.connect(self._open_review)
         self.download_button.clicked.connect(self._download_result)
 
     def _select_document(self) -> None:
@@ -138,6 +448,7 @@ class MainWindow(QMainWindow):
         self.status_value_label.setText("idle")
         self.progress_bar.setValue(0)
         self.download_button.setEnabled(False)
+        self.review_button.setEnabled(False)
         self._update_validation()
 
     def _handle_language_change(self, *_args: object) -> None:
@@ -237,6 +548,7 @@ class MainWindow(QMainWindow):
         self.status_value_label.setText("uploading")
         self.progress_bar.setValue(0)
         self.download_button.setEnabled(False)
+        self.review_button.setEnabled(False)
         self.message_label.setText("Uploading document to backend...")
 
         self.upload_worker = UploadWorker(
@@ -297,6 +609,7 @@ class MainWindow(QMainWindow):
         self.polling_worker.status_signal.connect(self._handle_status_update)
         self.polling_worker.progress_signal.connect(self._handle_progress_update)
         self.polling_worker.completed_signal.connect(self._handle_translation_completed)
+        self.polling_worker.needs_review_signal.connect(self._handle_translation_needs_review)
         self.polling_worker.failed_signal.connect(self._handle_translation_failed)
         self.polling_worker.error_signal.connect(self._handle_polling_error)
         self.polling_worker.finished.connect(self._cleanup_polling_worker)
@@ -317,26 +630,151 @@ class MainWindow(QMainWindow):
         )
         self.status_value_label.setText("completed")
         self.progress_bar.setValue(100)
+        self.review_button.setEnabled(False)
         self.download_button.setEnabled(True)
         self.message_label.setText(
             "Translation completed. Result is ready to download."
         )
         self._set_idle_state(update_message=False)
 
+    def _handle_translation_needs_review(self, payload: dict) -> None:
+        self.status_value_label.setText("needs_review")
+        self.progress_bar.setValue(int(payload.get("progress", 85)))
+        self.review_button.setEnabled(True)
+        self.download_button.setEnabled(False)
+        self.message_label.setText(
+            "Translation draft is ready. Review it before building the PDF."
+        )
+        self._set_idle_state(update_message=False)
+
     def _handle_translation_failed(self, message: str) -> None:
         self.status_value_label.setText("failed")
         self.progress_bar.setValue(100)
+        self.review_button.setEnabled(False)
         self.download_button.setEnabled(False)
         self.message_label.setText(self._friendly_worker_error(message))
         self._set_idle_state(update_message=False)
 
     def _handle_polling_error(self, message: str) -> None:
+        self.review_button.setEnabled(False)
         self.download_button.setEnabled(False)
         self.message_label.setText(self._friendly_worker_error(message))
         self._set_idle_state(update_message=False)
 
-    def _download_result(self, *_args: object) -> None:
+    def _open_review(self, *_args: object) -> None:
         if self.current_job_id is None:
+            self.message_label.setText("No review draft is available")
+            return
+
+        self.review_load_worker = ReviewLoadWorker(
+            job_id=self.current_job_id,
+            parent=self,
+        )
+        self.review_load_worker.started_signal.connect(self._set_review_loading_state)
+        self.review_load_worker.loaded_signal.connect(self._handle_review_loaded)
+        self.review_load_worker.error_signal.connect(self._handle_review_error)
+        self.review_load_worker.finished.connect(self._cleanup_review_load_worker)
+        self.review_load_worker.start()
+
+    def _set_review_loading_state(self) -> None:
+        self.review_button.setEnabled(False)
+        self.message_label.setText("Loading review draft...")
+
+    def _handle_review_loaded(self, draft: dict) -> None:
+        dialog = ReviewDialog(draft, self)
+        if dialog.exec() != QDialog.Accepted or not dialog.build_requested:
+            self.review_button.setEnabled(True)
+            self.message_label.setText("Review cancelled")
+            return
+        if self.current_job_id is None:
+            self.message_label.setText("No review draft is available")
+            return
+        self.review_complete_worker = ReviewCompleteWorker(
+            job_id=self.current_job_id,
+            blocks=dialog.review_updates(),
+            parent=self,
+        )
+        self.review_complete_worker.started_signal.connect(
+            self._set_review_building_state
+        )
+        self.review_complete_worker.completed_signal.connect(
+            self._handle_review_completed
+        )
+        self.review_complete_worker.error_signal.connect(self._handle_review_error)
+        self.review_complete_worker.finished.connect(
+            self._cleanup_review_complete_worker
+        )
+        self.review_complete_worker.start()
+
+    def _set_review_building_state(self) -> None:
+        self.review_button.setEnabled(False)
+        self.message_label.setText("Building reviewed PDF...")
+
+    def _handle_review_completed(self, payload: dict) -> None:
+        self._handle_translation_completed(payload)
+
+    def _handle_review_error(self, message: str) -> None:
+        self.review_button.setEnabled(True)
+        self.message_label.setText(self._friendly_worker_error(message))
+
+    def _load_review_file(self, *_args: object) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load review file",
+            "",
+            REVIEW_FILE_FILTER,
+        )
+        if not file_path:
+            return
+
+        try:
+            payload = validate_review_file_payload(
+                json.loads(Path(file_path).read_text(encoding="utf-8"))
+            )
+        except FileNotFoundError:
+            self.message_label.setText("Original PDF not found")
+            return
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            self.message_label.setText(self._friendly_worker_error(str(exc)))
+            return
+
+        dialog = ReviewDialog(payload, self)
+        if dialog.exec() != QDialog.Accepted or not dialog.build_requested:
+            self.message_label.setText("Review cancelled")
+            return
+
+        self.review_file_build_worker = ReviewFileBuildWorker(
+            review=dialog.review_file_payload(),
+            parent=self,
+        )
+        self.review_file_build_worker.started_signal.connect(
+            self._set_review_building_state
+        )
+        self.review_file_build_worker.completed_signal.connect(
+            self._handle_review_file_built
+        )
+        self.review_file_build_worker.error_signal.connect(self._handle_review_error)
+        self.review_file_build_worker.finished.connect(
+            self._cleanup_review_file_build_worker
+        )
+        self.review_file_build_worker.start()
+
+    def _handle_review_file_built(self, payload: dict) -> None:
+        self.current_job_id = None
+        self.result_file = (
+            str(payload.get("result_file")) if payload.get("result_file") else None
+        )
+        self.status_value_label.setText("completed")
+        self.progress_bar.setValue(100)
+        self.review_button.setEnabled(False)
+        self.download_button.setEnabled(bool(self.result_file))
+        self.message_label.setText(
+            "PDF built from review file. Result is ready to save."
+        )
+        self._set_idle_state(update_message=False)
+
+    def _download_result(self, *_args: object) -> None:
+        if self.current_job_id is None and not self.result_file:
             self.message_label.setText("No completed translation job to download")
             return
 
@@ -352,6 +790,16 @@ class MainWindow(QMainWindow):
         result_extension = self._result_extension()
         if Path(save_path).suffix.lower() != result_extension:
             save_path = f"{save_path}{result_extension}"
+
+        if self.current_job_id is None and self.result_file:
+            try:
+                Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+                copyfile(self.result_file, save_path)
+            except OSError as exc:
+                self.message_label.setText(f"Download failed: {exc}")
+                return
+            self.message_label.setText(f"Downloaded result to {save_path}")
+            return
 
         self.download_worker = DownloadWorker(
             job_id=self.current_job_id,
@@ -499,6 +947,21 @@ class MainWindow(QMainWindow):
             self.download_worker.deleteLater()
             self.download_worker = None
 
+    def _cleanup_review_load_worker(self) -> None:
+        if self.review_load_worker is not None:
+            self.review_load_worker.deleteLater()
+            self.review_load_worker = None
+
+    def _cleanup_review_complete_worker(self) -> None:
+        if self.review_complete_worker is not None:
+            self.review_complete_worker.deleteLater()
+            self.review_complete_worker = None
+
+    def _cleanup_review_file_build_worker(self) -> None:
+        if self.review_file_build_worker is not None:
+            self.review_file_build_worker.deleteLater()
+            self.review_file_build_worker = None
+
     def closeEvent(self, event: QCloseEvent) -> None:
         if self._has_blocking_worker():
             QMessageBox.warning(
@@ -517,6 +980,9 @@ class MainWindow(QMainWindow):
             self._is_worker_running(self.estimate_worker)
             or self._is_worker_running(self.upload_worker)
             or self._is_worker_running(self.download_worker)
+            or self._is_worker_running(self.review_load_worker)
+            or self._is_worker_running(self.review_complete_worker)
+            or self._is_worker_running(self.review_file_build_worker)
         )
 
     @staticmethod
